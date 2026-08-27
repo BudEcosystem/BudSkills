@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Convert a local wall-clock time into the UTC 5-field cron a Bud schedule needs.
+
+Bud stores `schedule.timezone` but never applies it: the next fire time is
+computed against a UTC clock. So the cron expression you send MUST already be in
+UTC. This converts for you and refuses to be quiet about daylight saving.
+
+Examples:
+    cron-utc 00:00 Asia/Kolkata               -> 30 18 * * *
+    cron-utc 09:30 America/New_York --weekdays
+    cron-utc 06:00 Europe/London --dom 1      -> first of the month, 06:00 London
+    cron-utc 23:15 UTC --json
+
+Exit status is 0 on success, 2 on bad input, and 1 when the time zone observes
+daylight saving (the expression is still printed - it is correct for exactly one
+half of the year).
+"""
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo, available_timezones
+except ImportError:  # pragma: no cover - Python < 3.9
+    print("cron-utc needs Python 3.9+ (zoneinfo)", file=sys.stderr)
+    sys.exit(2)
+
+DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+# cron day-of-week: 0 = Sunday .. 6 = Saturday (7 also Sunday)
+CRON_DOW = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+
+
+def parse_hhmm(value):
+    try:
+        hh, mm = value.split(":")
+        hh, mm = int(hh), int(mm)
+    except ValueError:
+        raise argparse.ArgumentTypeError("time must look like HH:MM, e.g. 00:00")
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise argparse.ArgumentTypeError("hour must be 0-23 and minute 0-59")
+    return hh, mm
+
+
+def observes_dst(tz, year):
+    """True when the zone's UTC offset is not constant across the year."""
+    offsets = set()
+    day = datetime(year, 1, 1, 12, tzinfo=tz)
+    for _ in range(365):
+        offsets.add(day.utcoffset())
+        day += timedelta(days=1)
+    return len(offsets) > 1
+
+
+def shift_dow(dows, day_delta):
+    """Shift cron day-of-week numbers when the UTC conversion crosses midnight."""
+    return sorted({(d + day_delta) % 7 for d in dows})
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="cron-utc",
+        description="Convert a local wall-clock time to a UTC cron for a Bud schedule.",
+        epilog="Feed the result to: POST /budpipeline/schedules "
+        '{"schedule":{"type":"cron","expression":"<result>","timezone":"UTC"}}',
+    )
+    ap.add_argument("time", type=parse_hhmm, help="local time as HH:MM (24h)")
+    ap.add_argument("zone", help='IANA time zone, e.g. Asia/Kolkata, or "UTC"')
+    ap.add_argument(
+        "--days",
+        help="comma-separated local weekdays (mon,tue,...); default every day",
+    )
+    ap.add_argument(
+        "--weekdays", action="store_true", help="shorthand for --days mon,tue,wed,thu,fri"
+    )
+    ap.add_argument("--dom", help="local day-of-month field (e.g. 1 or 1,15); default *")
+    ap.add_argument("--month", default="*", help="month field; default *")
+    ap.add_argument("--json", action="store_true", help="print a JSON object instead of the bare cron")
+    args = ap.parse_args(argv)
+
+    if args.zone not in available_timezones() and args.zone != "UTC":
+        print(f"cron-utc: unknown time zone {args.zone!r}", file=sys.stderr)
+        return 2
+    tz = ZoneInfo(args.zone)
+
+    hh, mm = args.time
+    # Use a January date so the offset is the zone's standard-time offset.
+    year = datetime.now(timezone.utc).year
+    local = datetime(year, 1, 15, hh, mm, tzinfo=tz)
+    utc = local.astimezone(timezone.utc)
+    day_delta = (utc.date() - local.date()).days  # -1, 0 or +1
+
+    if args.weekdays and args.days:
+        print("cron-utc: use --days or --weekdays, not both", file=sys.stderr)
+        return 2
+    days = "mon,tue,wed,thu,fri" if args.weekdays else args.days
+
+    if days:
+        try:
+            dows = sorted({CRON_DOW[d.strip().lower()[:3]] for d in days.split(",")})
+        except KeyError as exc:
+            print(f"cron-utc: unknown weekday {exc.args[0]!r}", file=sys.stderr)
+            return 2
+        dow_field = ",".join(str(d) for d in shift_dow(dows, day_delta))
+    else:
+        dow_field = "*"
+
+    dom_field = args.dom or "*"
+    warnings = []
+    if day_delta != 0 and dom_field != "*":
+        warnings.append(
+            f"the UTC instant falls on the {'previous' if day_delta < 0 else 'next'} "
+            f"day, so a day-of-month of {dom_field} in {args.zone} is NOT {dom_field} in UTC - "
+            "adjust it by hand or use a day-of-week instead"
+        )
+
+    expression = f"{utc.minute} {utc.hour} {dom_field} {args.month} {dow_field}"
+
+    dst = observes_dst(tz, year)
+    if dst:
+        warnings.append(
+            f"{args.zone} observes daylight saving. Bud has no way to follow it, so this "
+            "expression is right for standard time and one hour off for the rest of the year. "
+            "Tell the user before creating the schedule."
+        )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "expression": expression,
+                    "local": f"{hh:02d}:{mm:02d} {args.zone}",
+                    "utc": f"{utc.hour:02d}:{utc.minute:02d} UTC",
+                    "day_shift": day_delta,
+                    "dst": dst,
+                    "warnings": warnings,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(expression)
+        offset = local.utcoffset()
+        sign = "+" if offset >= timedelta(0) else "-"
+        total = abs(int(offset.total_seconds()))
+        print(
+            f"# {hh:02d}:{mm:02d} {args.zone} (UTC{sign}{total // 3600:02d}:{total % 3600 // 60:02d})"
+            f" = {utc.hour:02d}:{utc.minute:02d} UTC"
+            + ("  [previous day]" if day_delta < 0 else "  [next day]" if day_delta > 0 else ""),
+            file=sys.stderr,
+        )
+        for w in warnings:
+            print(f"# WARNING: {w}", file=sys.stderr)
+
+    return 1 if dst else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

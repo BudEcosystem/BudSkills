@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Score a run: deterministic checks first, then a judge for the rubrics.
+
+    score-run --run runs/v1.json --cases cases.jsonl
+
+Substring, regex and exact checks are free, exact and authoritative - where a
+case has them, they decide. Only cases whose correctness is a matter of
+behaviour (did it refuse? did it ask instead of guessing?) go to a judge, and
+they all go in one batch.
+
+The judge is you, the coding agent, by default - the script writes a grading
+brief, stops, and you write the verdicts. No network call, no API key.
+
+    --judge model --judge-model <deployment>   grade with a model deployed in
+                                               your own installation instead.
+
+The judge never sees the prompt under test or which candidate produced an
+answer, so it cannot favour one. It is recorded in the scored file, and `guard`
+refuses to compare two runs graded by different judges.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from budopt import common, scoring, stats, turns  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="score-run",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  score-run --run runs/v1.json --cases cases.jsonl\n"
+            "  score-run --run runs/v1.json --cases cases.jsonl --judge model "
+            "--judge-model my-strong-deploy\n"
+            "\nExit codes: 0 scored, 10 your turn to grade, 1 error.\n"
+        ),
+    )
+    ap.add_argument("--run", required=True, help="run file from run-cases")
+    ap.add_argument("--cases", required=True, help="the case file it was run against")
+    ap.add_argument("--out", help="where to write the scored run (default: overwrite --run)")
+    ap.add_argument("--judge", choices=["agent", "model", "none"], default="agent",
+                    help="who grades the rubrics: 'agent' = you, no network (default); "
+                         "'model' = a deployment; 'none' = skip, rubric cases score as failures")
+    ap.add_argument("--judge-model", help="deployment name, required with --judge model")
+    ap.add_argument("--keep-formatting", action="store_true",
+                    help="show the judge the raw markdown (default flattens it, because "
+                         "judges reward formatting more than they reward content)")
+    ap.add_argument("--workdir", default=".", help="where turn files live (default .)")
+    args = ap.parse_args()
+
+    run = common.read_json(args.run)
+    case_by_id = {str(c["id"]): c for c in common.read_jsonl(args.cases)}
+    results = run.get("results") or []
+    if not results:
+        raise SystemExit(f"score-run: {args.run} has no results")
+
+    # 1. deterministic pass - free, and it decides wherever it applies
+    pending: list[dict] = []
+    for row in results:
+        case = case_by_id.get(row["id"])
+        if not case:
+            row.update(verdict=scoring.VERDICT_FAIL, why="case id not in the case file",
+                       checks=[], judged=False)
+            continue
+        if row.get("error"):
+            row.update(verdict=scoring.VERDICT_FAIL, why=f"no answer: {row['error'][:80]}",
+                       checks=[], judged=False)
+            continue
+        det, reasons = scoring.deterministic(case, row.get("answer") or "")
+        row["checks"] = reasons
+        row["_det"] = det
+        if scoring.needs_judge(case, det):
+            pending.append({
+                "id": row["id"], "input": case["input"], "rubric": case["rubric"],
+                "reference": case.get("reference"), "answer": row.get("answer") or "",
+            })
+
+    # 2. one grading batch for everything that needs a rubric verdict
+    verdicts: dict[str, dict] = {}
+    judge_identity = "deterministic-only"
+    if pending and args.judge != "none":
+        if args.judge == "model" and not args.judge_model:
+            raise SystemExit("score-run: --judge model needs --judge-model <deployment>")
+        if args.judge == "model" and args.judge_model == run.get("target"):
+            common.note(
+                "warning: the judge and the thing under test are the same model. Models "
+                "measurably prefer their own idiom, so this inflates the score. Use a "
+                "different deployment as judge if you have one."
+            )
+        ref = turns.Reflector(
+            args.judge, Path(args.workdir),
+            model=args.judge_model, max_tokens=max(1200, 60 * len(pending)),
+        )
+        judge_identity = ref.identity
+        brief = turns.format_brief(
+            f"Grade {len(pending)} answers",
+            [
+                ("How to grade", scoring.JUDGE_INSTRUCTIONS),
+                ("Output format", scoring.JUDGE_FORMAT),
+                ("Cases", scoring.judge_brief(pending, flatten=not args.keep_formatting)),
+            ],
+        )
+        slot = f"judge-{common.sha(args.run)}"
+        try:
+            raw = ref.ask(
+                slot, brief,
+                summary=f"Grade {len(pending)} answer(s) against their stated requirement.",
+                ext="jsonl",
+            )
+        except turns.AgentTurnRequired as need:
+            return need.report()
+        verdicts = scoring.parse_verdicts(raw)
+        missing = [p["id"] for p in pending if p["id"] not in verdicts]
+        if missing:
+            common.note(
+                f"warning: the judge returned no verdict for {len(missing)} case(s) "
+                f"({', '.join(missing[:5])}). They score as failures - an ungraded case "
+                "is not a free pass."
+            )
+    elif pending:
+        common.note(
+            f"note: --judge none, so {len(pending)} rubric case(s) score as failures."
+        )
+
+    # 3. collapse to one verdict per case
+    passed = 0
+    for row in results:
+        if "verdict" in row:
+            continue
+        judged = verdicts.get(row["id"])
+        verdict, why = scoring.final_verdict(row.pop("_det", None), judged)
+        row.update(verdict=verdict, why=why, judged=bool(judged))
+    for row in results:
+        row.pop("_det", None)
+        if row["verdict"] == scoring.VERDICT_PASS:
+            passed += 1
+
+    total = len(results)
+    low, high = stats.wilson_interval(passed, total)
+    by_cat: dict[str, list[int]] = {}
+    for row in results:
+        cell = by_cat.setdefault(row.get("category", "typical"), [0, 0])
+        cell[1] += 1
+        if row["verdict"] == scoring.VERDICT_PASS:
+            cell[0] += 1
+
+    run["score"] = {
+        "passed": passed,
+        "total": total,
+        "pass_rate": round(passed / total, 4) if total else 0.0,
+        "ci95": [round(low, 4), round(high, 4)],
+        "judge": judge_identity,
+        "judged_cases": len(verdicts),
+        "by_category": {k: {"passed": v[0], "total": v[1]} for k, v in sorted(by_cat.items())},
+    }
+    out = Path(args.out or args.run)
+    common.write_json(out, run)
+
+    print(f"{run.get('target')}  {passed}/{total} = {passed / total * 100:.1f}% "
+          f"(95% CI {low * 100:.0f}-{high * 100:.0f}%)  judge={judge_identity}")
+    for cat, cell in sorted(by_cat.items()):
+        print(f"  {cat:<14} {cell[0]:>3}/{cell[1]:<3}")
+    failures = [r for r in results if r["verdict"] != scoring.VERDICT_PASS]
+    if failures:
+        print(f"\n{len(failures)} failing case(s) - this is the work list:")
+        for row in failures[:15]:
+            print(f"  {row['id']:<28} {row['why'][:70]}")
+        if len(failures) > 15:
+            print(f"  ... and {len(failures) - 15} more (all of them are in {out})")
+    common.note(f"\nwrote {out}")
+    if total < 20:
+        common.note(
+            f"warning: {total} cases is too few to compare anything. The smallest "
+            "difference that could ever be significant here is "
+            f"{stats.detectable_delta(total) * 100:.0f} percentage points."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Call a Bud deployment from the command line, with the setup done for you.
+
+Sending inference to Bud needs three things that are easy to get wrong: the
+gateway host (a different host from the management API), a token that has been
+*registered* with the gateway, and the deployment name rather than the model
+name. This resolves all three, retries once on an expired token, and explains
+the failure when there is one.
+
+    bud-infer models                              list the names you may call
+    bud-infer check  <deployment>                 end-to-end smoke test
+    bud-infer chat   <deployment> "prompt"        one chat completion
+    bud-infer embed  <deployment> "text" ...      embeddings for one or more texts
+
+Environment:
+    BUD_API_URL          management API origin, e.g. https://app.dev.bud.studio
+    BUD_GATEWAY_URL      gateway origin; derived from BUD_API_URL when unset
+    BUD_GATEWAY_TOKEN    bearer token; minted with `bud token` when unset
+
+Requires `bud` (from the bud-platform skill) on PATH for token minting.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+TIMEOUT = 120
+
+
+def err(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> "int":
+    err(msg)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# discovery
+
+
+def derive_gateway(api_url: str) -> str:
+    """https://app.dev.example.com -> https://gateway.dev.example.com"""
+    scheme, _, rest = api_url.partition("://")
+    host = rest.split("/")[0]
+    labels = host.split(".")
+    if len(labels) > 2:
+        labels = labels[1:]
+    return f"{scheme or 'https'}://gateway." + ".".join(labels)
+
+
+def probe(base: str) -> bool:
+    """A gateway answers /v1/models with 401 when unauthenticated."""
+    try:
+        urllib.request.urlopen(base.rstrip("/") + "/v1/models", timeout=15)
+        return True  # 200 would mean auth is disabled; still a gateway
+    except urllib.error.HTTPError as exc:
+        return exc.code == 401
+    except Exception:
+        return False
+
+
+def gateway_url() -> str:
+    explicit = os.environ.get("BUD_GATEWAY_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    api = os.environ.get("BUD_API_URL")
+    if not api:
+        die("Set BUD_API_URL (or BUD_GATEWAY_URL). See the bud-platform skill.")
+    candidate = derive_gateway(api)
+    if not probe(candidate):
+        die(
+            f"No inference gateway found at {candidate}.\n"
+            "Derivation from BUD_API_URL failed - ask for the gateway address and\n"
+            "set BUD_GATEWAY_URL. A gateway answers GET /v1/models with 401."
+        )
+    return candidate
+
+
+# --------------------------------------------------------------------------- #
+# credentials
+
+
+def mint_token() -> str:
+    exe = shutil.which("bud")
+    if not exe:
+        here = os.path.dirname(os.path.abspath(__file__))
+        cand = os.path.normpath(os.path.join(here, "..", "..", "bud-platform", "scripts", "bud"))
+        if os.path.exists(cand):
+            exe = cand
+    if not exe:
+        die("`bud` not found on PATH. Set BUD_GATEWAY_TOKEN, or install the bud-platform toolkit.")
+    proc = subprocess.run([exe, "token"], capture_output=True, text=True)
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token:
+        die("Could not mint a gateway token:\n" + (proc.stderr.strip() or "no output"))
+    return token
+
+
+class Session:
+    def __init__(self) -> None:
+        self.base = gateway_url()
+        self.token = os.environ.get("BUD_GATEWAY_TOKEN") or mint_token()
+        self._reminted = False
+
+    def call(self, path: str, body=None, headers=None, raw: bool = False):
+        """Returns (status, parsed-or-text). Re-mints once on 401."""
+        url = self.base + path
+        data = json.dumps(body).encode() if body is not None else None
+        hdrs = {"Authorization": f"Bearer {self.token}"}
+        if data is not None:
+            hdrs["Content-Type"] = "application/json"
+        hdrs.update(headers or {})
+        req = urllib.request.Request(url, data=data, headers=hdrs,
+                                     method="POST" if data is not None else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                text = resp.read().decode("utf-8", "replace")
+                return resp.status, (text if raw else _maybe_json(text))
+        except urllib.error.HTTPError as exc:
+            text = exc.read().decode("utf-8", "replace")
+            if exc.code == 401 and not self._reminted and not os.environ.get("BUD_GATEWAY_TOKEN"):
+                err("401 from the gateway - re-minting and registering a token, then retrying once.")
+                self._reminted = True
+                self.token = mint_token()
+                return self.call(path, body, headers, raw)
+            return exc.code, _maybe_json(text)
+        except Exception as exc:  # network, TLS, timeout
+            return 0, {"error": {"message": str(exc)}}
+
+
+def _maybe_json(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+# --------------------------------------------------------------------------- #
+# diagnosis
+
+
+def diagnose(status: int, payload) -> str:
+    blob = json.dumps(payload) if not isinstance(payload, str) else payload
+    low = blob.lower()
+    if status == 401:
+        return ("The token is not registered with the gateway, has expired, or the header\n"
+                "said 'bearer' rather than 'Bearer'. Run `bud token` again. A key from\n"
+                "POST /credentials/ is encrypted and will never work here.")
+    if status == 404 and "model not found" in low:
+        if "gpt-4-responses" in low:
+            return "Add the header  x-model-name: <deployment name>  to Responses sub-resource calls."
+        return ("Use the DEPLOYMENT name, not the model name, and check the deployment is\n"
+                "running:  bud-infer models")
+    if status == 400 and "capability" in low:
+        return "Right deployment, wrong path. Check its supported_endpoints and use a path it serves."
+    if status == 400 and "invalid request body" in low:
+        return "Multipart uploads are rejected on authenticated installations. Use a JSON path."
+    if "only supports streaming" in low:
+        return 'That deployment is streaming-only. Resend with "stream": true.'
+    if status == 402:
+        return "A spend limit, not a rate limit. Stop and check the budget - retrying cannot help."
+    if status == 429:
+        return "Rate limited. Honour Retry-After; do not raise concurrency."
+    if status == 500 and "guardrail" in low:
+        return "The deployment's safety policy is failing. A deployment problem - do not retry in a loop."
+    if status == 502:
+        return ("The model process or, for a hosted model, its upstream provider rejected the call.\n"
+                "For embeddings this is usually encoding_format=base64 - use \"float\".")
+    if status == 0:
+        return "Could not reach the gateway at all. Check BUD_GATEWAY_URL and network access."
+    return ""
+
+
+def report(status: int, payload) -> int:
+    ok = 200 <= status < 300
+    print(json.dumps(payload, indent=2) if not isinstance(payload, str) else payload)
+    if not ok:
+        hint = diagnose(status, payload)
+        err(f"\nHTTP {status}." + (f"\n{hint}" if hint else ""))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# commands
+
+
+def cmd_models(s: Session, args) -> int:
+    status, payload = s.call("/v1/models")
+    if status != 200:
+        return report(status, payload)
+    for item in payload.get("data", []):
+        print(item.get("id"))
+    return 0
+
+
+def cmd_chat(s: Session, args) -> int:
+    body = {"model": args.deployment,
+            "messages": [{"role": "user", "content": args.prompt}],
+            "max_tokens": args.max_tokens}
+    if args.stream:
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+        status, payload = s.call("/v1/chat/completions", body, raw=True)
+        return report(status, payload)
+    status, payload = s.call("/v1/chat/completions", body)
+    if status == 200 and not args.json:
+        choice = (payload.get("choices") or [{}])[0]
+        content = (choice.get("message") or {}).get("content")
+        if content is None:
+            err(f"Empty content with finish_reason={choice.get('finish_reason')!r}. "
+                "A reasoning model may have spent the whole budget thinking - raise --max-tokens.")
+        print(content if content is not None else "")
+        err(f"usage: {json.dumps(payload.get('usage'))}   inference id: {payload.get('id')}")
+        return 0
+    return report(status, payload)
+
+
+def cmd_embed(s: Session, args) -> int:
+    body = {"model": args.deployment, "input": args.text, "encoding_format": "float"}
+    status, payload = s.call("/v1/embeddings", body)
+    if status == 200 and not args.json:
+        for row in payload.get("data", []):
+            vec = row.get("embedding") or []
+            print(f"[{row.get('index')}] dim={len(vec)} first={vec[:4]}")
+        err(f"usage: {json.dumps(payload.get('usage'))}")
+        return 0
+    return report(status, payload)
+
+
+def cmd_check(s: Session, args) -> int:
+    err(f"gateway:    {s.base}")
+    status, payload = s.call("/v1/models")
+    if status != 200:
+        return report(status, payload)
+    names = [m.get("id") for m in payload.get("data", [])]
+    err(f"callable:   {len(names)} deployment(s)")
+    if args.deployment not in names:
+        near = [n for n in names if args.deployment.lower() in str(n).lower()][:5]
+        err(f"'{args.deployment}' is not callable with this credential.")
+        if near:
+            err("Did you mean: " + ", ".join(near))
+        else:
+            err("Use `bud-infer models` for the full list. The value must be the DEPLOYMENT\n"
+                "name, and the deployment must be running and in a project you can see.")
+        return 1
+    err(f"alias:      {args.deployment} OK")
+
+    # The deployment may serve chat, embeddings or neither. A wrong path does not
+    # always answer with a clean capability error - some serving processes reply
+    # 502 with their own "not found" - so try chat, then embeddings, and only
+    # report a failure when both are refused.
+    chat_status, chat_payload = s.call("/v1/chat/completions", {
+        "model": args.deployment,
+        "messages": [{"role": "user", "content": "Reply with the single word OK."}],
+        "max_tokens": 16})
+    if chat_status == 200:
+        choice = (chat_payload.get("choices") or [{}])[0]
+        err(f"chat:       OK (finish_reason={choice.get('finish_reason')}, "
+            f"tokens={(chat_payload.get('usage') or {}).get('total_tokens')})")
+        return 0
+    if "only supports streaming" in json.dumps(chat_payload).lower():
+        err("chat:       OK, but this deployment is streaming-only "
+            '(resend with "stream": true)')
+        return 0
+
+    err("chat:       refused - trying embeddings")
+    emb_status, emb_payload = s.call("/v1/embeddings", {
+        "model": args.deployment, "input": ["ping"], "encoding_format": "float"})
+    if emb_status == 200:
+        dim = len((emb_payload.get("data") or [{}])[0].get("embedding") or [])
+        err(f"embeddings: OK ({dim} dimensions)")
+        return 0
+
+    err("embeddings: refused as well - reporting the chat failure")
+    return report(chat_status, chat_payload)
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        prog="bud-infer",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("models", help="list the deployment names this credential may call"
+                   ).set_defaults(func=cmd_models)
+
+    c = sub.add_parser("check", help="smoke-test one deployment end to end")
+    c.add_argument("deployment")
+    c.set_defaults(func=cmd_check)
+
+    c = sub.add_parser("chat", help="send one chat completion")
+    c.add_argument("deployment")
+    c.add_argument("prompt")
+    c.add_argument("--max-tokens", type=int, default=256)
+    c.add_argument("--stream", action="store_true", help="print the raw SSE stream")
+    c.add_argument("--json", action="store_true", help="print the whole response object")
+    c.set_defaults(func=cmd_chat)
+
+    c = sub.add_parser("embed", help="embed one or more texts")
+    c.add_argument("deployment")
+    c.add_argument("text", nargs="+")
+    c.add_argument("--json", action="store_true", help="print the whole response object")
+    c.set_defaults(func=cmd_embed)
+
+    args = p.parse_args(argv)
+    return args.func(Session(), args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

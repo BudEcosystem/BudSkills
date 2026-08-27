@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Run a case file against a prompt and record what came back.
+
+Two kinds of target:
+
+    --target <deployment-name>            a deployed model; pair it with
+                                          --prompt <file> to test a candidate
+                                          system prompt
+    --target agent:<agent-name>           a Bud agent, using its default
+                                          prompt version
+    --target agent:<agent-name>:v3        that agent's version 3 specifically
+
+Answers are cached on (target, prompt, input, settings), so re-running after an
+interruption costs nothing and only the missing cases are sent.
+
+    run-cases --cases cases.jsonl --target my-deploy --prompt v1.txt --out runs/v1.json
+
+Nothing here needs a third-party key: inference goes to your own installation's
+gateway with a token minted by `bud token`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from budopt import common  # noqa: E402
+
+
+def parse_target(target: str) -> dict:
+    """Work out how to address the thing under test."""
+    if target.startswith("agent:"):
+        rest = target[len("agent:") :]
+        version = None
+        if ":v" in rest:
+            rest, _, ver = rest.rpartition(":v")
+            version = ver
+        return {"kind": "agent", "name": rest, "version": version}
+    return {"kind": "deployment", "name": target, "version": None}
+
+
+def ask(spec: dict, case: dict, system: str | None, args: argparse.Namespace) -> tuple[str, dict]:
+    """Send one case to the target. Returns (answer, usage). Raises GatewayError."""
+    if spec["kind"] == "agent":
+        # The object form is the ONLY form that applies the agent's own prompt.
+        # Naming the agent in the `model` field instead is accepted, returns
+        # 200, and silently answers from the bare model with no prompt at all.
+        prompt: dict = {"id": spec["name"]}
+        if spec["version"]:
+            prompt["version"] = str(spec["version"])
+        body: dict = {"prompt": prompt, "input": case["input"], "stream": False}
+        if args.max_tokens:
+            body["max_output_tokens"] = args.max_tokens
+        out = common.gateway_post("/v1/responses", body, timeout=args.timeout)
+        err = out.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            raise common.GatewayError(str(err["message"])[:300])
+        return common.responses_text(out), (out.get("usage") or {})
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": case["input"]})
+    return common.chat(
+        spec["name"], messages,
+        max_tokens=args.max_tokens, temperature=args.temperature, timeout=args.timeout,
+    )
+
+
+def preflight(spec: dict, system: str | None, args: argparse.Namespace) -> None:
+    """One probe, to fail fast and to catch a target that is not what it looks like."""
+    probe = {"id": "__preflight__", "input": "Reply with the single word: READY"}
+    try:
+        answer, usage = ask(spec, probe, system, args)
+    except common.GatewayError as exc:
+        raise SystemExit(f"run-cases: target {args.target!r} is not answering.\n  {exc}") from None
+    if not (answer or "").strip():
+        common.note(f"warning: {args.target} answered the probe with nothing.")
+    if spec["kind"] == "agent":
+        used = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        if used and used < 60:
+            common.note(
+                f"warning: the probe used only {used} input tokens, which is too few for an "
+                f"agent with a system prompt. You may be measuring the bare model rather than "
+                f"{spec['name']}. Confirm with:  bud api GET /prompts -q name={spec['name']}"
+            )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="run-cases",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  run-cases --cases cases.jsonl --target my-deploy --prompt v1.txt \\\n"
+            "            --split train --out runs/v1-train.json\n"
+            "  run-cases --cases cases.jsonl --target agent:hr-assistant:v2 --out runs/v2.json\n"
+        ),
+    )
+    ap.add_argument("--cases", required=True, help="case file (JSONL)")
+    ap.add_argument("--target", required=True,
+                    help="deployment name, or agent:<name>[:v<N>]")
+    ap.add_argument("--prompt", help="file holding the system prompt under test "
+                                     "(deployment targets only; an agent carries its own)")
+    ap.add_argument("--out", required=True, help="run file to write (JSON)")
+    ap.add_argument("--split", choices=["train", "holdout", "all"], default="all",
+                    help="which half of the case file to run (default all)")
+    ap.add_argument("--concurrency", type=int, default=3,
+                    help="parallel requests (default 3; keep it low, this is shared compute)")
+    ap.add_argument("--max-tokens", type=int, default=800)
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="omitted by default - several models reject an explicit temperature")
+    ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--limit", type=int, help="run only the first N cases (smoke run)")
+    ap.add_argument("--no-cache", action="store_true", help="ignore any cached answers")
+    args = ap.parse_args()
+
+    spec = parse_target(args.target)
+    if spec["kind"] == "agent" and args.prompt:
+        common.note(
+            "note: --prompt is ignored for an agent target. An agent version carries its own "
+            "prompt; to test a new one, create a new version (see bud-agents)."
+        )
+    system = Path(args.prompt).read_text(encoding="utf-8") if args.prompt and spec["kind"] != "agent" else None
+
+    all_cases = common.read_jsonl(args.cases)
+    cases = [c for c in all_cases if args.split == "all" or c.get("split", "train") == args.split]
+    if args.limit:
+        cases = cases[: args.limit]
+    if not cases:
+        raise SystemExit(f"run-cases: no cases matched --split {args.split}")
+
+    fingerprint = common.sha("|".join([
+        args.target, system or "", str(args.max_tokens), str(args.temperature),
+    ]))
+    out_path = Path(args.out)
+    cache: dict[str, dict] = {}
+    if out_path.is_file() and not args.no_cache:
+        try:
+            prev = common.read_json(out_path)
+            if prev.get("fingerprint") == fingerprint:
+                cache = {r["id"]: r for r in prev.get("results", []) if not r.get("error")}
+        except (OSError, ValueError, KeyError):
+            cache = {}
+    todo = [c for c in cases if str(c["id"]) not in cache]
+
+    common.note(
+        f"run-cases: {len(cases)} case(s) against {args.target}"
+        + (f" [{len(cache)} reused from {out_path.name}]" if cache else "")
+    )
+    if not todo:
+        common.note("everything was cached; nothing sent.")
+
+    if todo:
+        preflight(spec, system, args)
+
+    started = time.time()
+
+    def one(case: dict) -> dict:
+        t0 = time.time()
+        row = {
+            "id": str(case["id"]),
+            "category": case.get("category", "typical"),
+            "split": case.get("split", "train"),
+            "input": case["input"],
+        }
+        try:
+            answer, usage = ask(spec, case, system, args)
+            row.update(answer=answer, error=None, usage=usage)
+        except common.GatewayError as exc:
+            row.update(answer="", error=str(exc)[:300], usage={})
+        row["seconds"] = round(time.time() - t0, 2)
+        return row
+
+    fresh: list[dict] = []
+    if todo:
+        with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+            for i, row in enumerate(pool.map(one, todo), 1):
+                fresh.append(row)
+                if i % 10 == 0 or i == len(todo):
+                    common.note(f"  {i}/{len(todo)}")
+
+    by_id = {**cache, **{r["id"]: r for r in fresh}}
+    results = [by_id[str(c["id"])] for c in cases if str(c["id"]) in by_id]
+    errors = [r for r in results if r.get("error")]
+    tokens = sum(
+        (r.get("usage") or {}).get("total_tokens", 0) for r in results if isinstance(r.get("usage"), dict)
+    )
+
+    common.write_json(out_path, {
+        "target": args.target,
+        "target_kind": spec["kind"],
+        "prompt_file": args.prompt,
+        "prompt_sha": common.sha(system) if system else None,
+        "prompt_chars": len(system) if system else None,
+        "cases_file": args.cases,
+        "split": args.split,
+        "fingerprint": fingerprint,
+        "created": int(time.time()),
+        "settings": {"max_tokens": args.max_tokens, "temperature": args.temperature},
+        "totals": {
+            "cases": len(results),
+            "errors": len(errors),
+            "tokens": tokens,
+            "seconds": round(time.time() - started, 1),
+        },
+        "results": results,
+    })
+    common.note(
+        f"wrote {out_path}: {len(results)} answers, {len(errors)} error(s), ~{tokens} tokens"
+    )
+    if errors:
+        common.note(
+            f"  {len(errors)} case(s) failed to get an answer, e.g. {errors[0]['id']}: "
+            f"{errors[0]['error'][:120]}\n"
+            "  Errored cases score as failures. Re-run to retry only those."
+        )
+    common.note("next:  score-run --run " + str(out_path) + " --cases " + args.cases)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Entry point for the Bud Foundry toolkit.
+#
+# Resolves through symlinks so the command works when installed onto PATH via a
+# symlink as well as when called by its real path.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+exec "${BUD_PYTHON:-python3}" -c 'import sys; sys.path.insert(0, sys.argv[1]); from budkit.cli import main; sys.exit(main(sys.argv[2:]))' "$HERE" "$@"

@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Propose improved prompts from the cases the current one fails.
+
+    propose-prompt --prompt v1.txt --run runs/v1-train.json --cases cases.jsonl \
+                   --out-dir candidates/ --n 4
+
+This is the optimisation step. It shows a small sample of *failing* cases -
+what was asked, what a correct answer needed, what actually came back - and
+asks for rewritten prompts that fix them without breaking what already works.
+
+Strategies (`--strategy`, default `mixed` which uses one of each):
+
+    reflect    diagnose why each failure happened, then edit the instructions
+    fewshot    keep the instructions and add worked examples drawn from cases
+               the prompt already gets right - usually the single biggest
+               lever, and the cheapest
+    constrain  tighten scope, refusal rules and output shape; nothing else
+    compress   same behaviour, fewer words - a long prompt overfits
+
+Only the `train` split is ever shown. The holdout exists to catch a prompt that
+was tuned into the shape of its own test set, and it cannot do that if the
+optimiser has seen it.
+
+By default *you*, the coding agent, write the candidates - no network, no key.
+`--via model --model <deployment>` uses a model in your own installation
+instead, but note that proposing a better prompt is a much harder job than
+answering the questions: a small model tends to produce trivial rewordings.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import textwrap
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from budopt import common, turns  # noqa: E402
+
+STRATEGIES = {
+    "reflect": """
+        For each failure, state privately what went wrong - a missing rule, an
+        ambiguous instruction, a scope that was never defined - then rewrite the
+        instructions so that failure cannot recur. Change as little as possible;
+        every extra sentence is something else that can misfire.
+    """,
+    "fewshot": """
+        Keep the instructions essentially as they are and add two or three short
+        worked examples. Draw them from the cases the prompt ALREADY gets right,
+        choosing ones whose shape matches the failures. Show the input and a
+        model answer. Examples teach format and edge handling far more reliably
+        than another paragraph of instruction.
+    """,
+    "constrain": """
+        Change only scope and shape: say explicitly what is in scope, what must
+        be declined and in what words, what a well-formed answer contains, and
+        what must never appear. Do not add subject-matter content.
+    """,
+    "compress": """
+        Preserve behaviour exactly and cut the length hard. Remove repetition,
+        hedging and instructions that restate each other. A shorter prompt
+        generalises better; length is where prompts overfit.
+    """,
+}
+
+BLOCK = re.compile(
+    r"###\s*CANDIDATE\s*(\d+).*?RATIONALE:\s*(.*?)\n.*?<<<\s*\n(.*?)\n>>>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def failure_digest(run: dict, case_by_id: dict, limit: int) -> str:
+    fails = [r for r in run.get("results") or [] if r.get("verdict") != "PASS"]
+    if not fails:
+        return ""
+    # Spread the sample across categories: three failures of the same kind
+    # produce three edits that say the same thing.
+    picked: list[dict] = []
+    seen: set[str] = set()
+    for row in fails:
+        cat = row.get("category", "typical")
+        if cat not in seen:
+            picked.append(row)
+            seen.add(cat)
+    for row in fails:
+        if len(picked) >= limit:
+            break
+        if row not in picked:
+            picked.append(row)
+    blocks = []
+    for row in picked[:limit]:
+        case = case_by_id.get(row["id"], {})
+        parts = [
+            f"### FAILED: {row['id']}  ({row.get('category')})",
+            f"ASKED: {row.get('input', '').strip()}",
+        ]
+        if case.get("rubric"):
+            parts.append(f"REQUIRED: {case['rubric'].strip()}")
+        if case.get("reference"):
+            parts.append(f"CORRECT ANSWER: {str(case['reference']).strip()[:500]}")
+        if case.get("expect_contains"):
+            parts.append(f"MUST CONTAIN: {case['expect_contains']}")
+        if case.get("expect_absent"):
+            parts.append(f"MUST NOT CONTAIN: {case['expect_absent']}")
+        parts.append(f"WHY IT FAILED: {row.get('why', '')}")
+        parts.append(f"ACTUAL ANSWER: {(row.get('answer') or '(empty)').strip()[:700]}")
+        blocks.append("\n".join(parts))
+    return "\n\n".join(blocks)
+
+
+def success_digest(run: dict, case_by_id: dict, limit: int) -> str:
+    wins = [r for r in run.get("results") or [] if r.get("verdict") == "PASS" and r.get("answer")]
+    blocks = []
+    for row in wins[:limit]:
+        blocks.append(
+            f"### PASSED: {row['id']}\nASKED: {row.get('input', '').strip()}\n"
+            f"GOOD ANSWER: {(row.get('answer') or '').strip()[:500]}"
+        )
+    return "\n\n".join(blocks)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="propose-prompt",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  propose-prompt --prompt v1.txt --run runs/v1-train.json --cases cases.jsonl \\\n"
+            "                 --out-dir candidates/round2 --n 4\n"
+            "\nExit codes: 0 candidates written, 10 your turn, 1 error.\n"
+        ),
+    )
+    ap.add_argument("--prompt", required=True, help="the prompt being improved")
+    ap.add_argument("--run", required=True, help="a SCORED run of that prompt on the train split")
+    ap.add_argument("--cases", required=True, help="the case file")
+    ap.add_argument("--out-dir", required=True, help="directory to write candidates into")
+    ap.add_argument("--n", type=int, default=4, help="how many candidates (default 4)")
+    ap.add_argument("--strategy", choices=[*STRATEGIES, "mixed"], default="mixed")
+    ap.add_argument("--failures", type=int, default=3,
+                    help="how many failing cases to show (default 3; more dilutes the diagnosis)")
+    ap.add_argument("--examples", type=int, default=3, help="how many passing cases to show")
+    ap.add_argument("--max-chars", type=int, default=1500,
+                    help="length cap on a candidate (default 1500; unbounded prompts overfit)")
+    ap.add_argument("--via", choices=["agent", "model"], default="agent")
+    ap.add_argument("--model", help="deployment name, required with --via model")
+    ap.add_argument("--workdir", default=".", help="where turn files live (default .)")
+    args = ap.parse_args()
+
+    current = Path(args.prompt).read_text(encoding="utf-8")
+    run = common.read_json(args.run)
+    if run.get("split") == "holdout":
+        raise SystemExit(
+            "propose-prompt: that run is on the holdout split. The optimiser must never see "
+            "the holdout - it is the only thing standing between you and a prompt tuned to "
+            "the shape of its own test set. Use the train run."
+        )
+    case_by_id = {str(c["id"]): c for c in common.read_jsonl(args.cases)}
+    fails = failure_digest(run, case_by_id, args.failures)
+    if not fails:
+        common.note("propose-prompt: nothing failed in that run - there is nothing to fix.")
+        return 0
+
+    score = run.get("score") or {}
+    if args.strategy == "mixed":
+        order = ["fewshot", "reflect", "constrain", "compress"]
+        chosen = [order[i % len(order)] for i in range(args.n)]
+    else:
+        chosen = [args.strategy] * args.n
+    plan = "\n".join(
+        f"**Candidate {i + 1} - {name}**\n" + textwrap.dedent(STRATEGIES[name]).strip()
+        for i, name in enumerate(chosen)
+    )
+
+    sections = [
+        ("The prompt as it stands", f"It scores {score.get('passed')}/{score.get('total')} "
+                                    f"on the training cases.\n\n```\n{current.strip()}\n```"),
+        ("Cases it gets wrong", fails),
+    ]
+    wins = success_digest(run, case_by_id, args.examples)
+    if wins:
+        sections.append(("Cases it gets right - do not break these", wins))
+    sections += [
+        ("Write these candidates", plan),
+        ("Rules", f"""
+            - Fix the failures shown. Do NOT change anything the failures do not
+              implicate - an unrelated edit makes the result uninterpretable.
+            - Keep each candidate under {args.max_chars} characters. A prompt that grows
+              every round is memorising this test set, and it will not generalise.
+            - Do not name or quote the specific test cases as rules ("when asked about
+              carry-over, say 5 days"). That is not a better prompt, it is a lookup table,
+              and the holdout split will catch it.
+            - Each candidate must be a complete, standalone system prompt - not a diff and
+              not a description of one.
+            - Candidates must differ from each other in substance, not wording.
+        """),
+        ("Output format - exactly this, nothing else", """
+            ### CANDIDATE 1
+            RATIONALE: one line saying what you changed and which failure it addresses
+            PROMPT:
+            <<<
+            ...the complete system prompt...
+            >>>
+
+            ### CANDIDATE 2
+            ...
+        """),
+    ]
+    brief = turns.format_brief("Improve this prompt", sections)
+
+    ref = turns.Reflector(args.via, Path(args.workdir), model=args.model,
+                          max_tokens=1200 + args.n * (args.max_chars // 2))
+    slot = f"propose-{common.sha(current + args.run)}"
+    try:
+        raw = ref.ask(slot, brief, summary=f"Write {args.n} improved candidate prompts.", ext="md")
+    except turns.AgentTurnRequired as need:
+        return need.report()
+
+    blocks = BLOCK.findall(raw)
+    if not blocks:
+        common.note(
+            "propose-prompt: no candidates found. Each one must be wrapped exactly as:\n"
+            "  ### CANDIDATE 1\n  RATIONALE: ...\n  PROMPT:\n  <<<\n  ...\n  >>>"
+        )
+        return 1
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for num, rationale, body in blocks[: args.n]:
+        text = body.strip() + "\n"
+        path = out_dir / f"cand-{int(num):02d}.txt"
+        path.write_text(text, encoding="utf-8")
+        over = len(text) > args.max_chars
+        manifest.append({
+            "file": str(path), "strategy": chosen[len(manifest) % len(chosen)],
+            "rationale": rationale.strip(), "chars": len(text), "over_limit": over,
+        })
+        flag = f"  OVER LIMIT ({len(text)} > {args.max_chars})" if over else ""
+        print(f"{path}  {len(text):>5} chars  {rationale.strip()[:70]}{flag}")
+    common.write_json(out_dir / "candidates.json", {
+        "from_prompt": args.prompt, "from_run": args.run,
+        "baseline_score": score, "candidates": manifest,
+    })
+    common.note(
+        f"\nwrote {len(manifest)} candidate(s) to {out_dir}\n"
+        "Run each on the TRAIN split, keep the best, then confirm it on the holdout "
+        "with guard before promoting anything."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

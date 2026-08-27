@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Review one agent's traces over a window and summarise failures, latency and cost.
+
+Fetches every trace an agent produced in a time window, groups the failures by
+signature, pulls the real request/response content out of the failing spans, adds
+tool-error and token/cost figures, and compares the whole thing with the previous
+window of the same length. Emits one JSON document on stdout.
+
+Designed to be the body of a nightly routine: schedule it, then reason over its
+output and turn the findings into a prompt change.
+
+Examples
+--------
+  # yesterday, in the user's timezone
+  agent-trace-review --agent latest-ai-news-summarizer --date yesterday --tz +05:30
+
+  # an explicit UTC window, no day-over-day comparison
+  agent-trace-review --agent latest-ai-news-summarizer \
+      --from 2026-08-05T00:00:00Z --to 2026-08-06T00:00:00Z --no-compare
+
+  # an agent given by UUID, more failing traces expanded
+  agent-trace-review --agent c1977027-4b31-4ad7-870c-95d36b8663c7 --max-detail 20
+
+Environment: BUD_API_URL, BUD_EMAIL, BUD_PASSWORD (see the bud-platform skill).
+Read-only: issues GETs plus POSTs to read-only analytics endpoints. Nothing is
+created, changed or deleted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# The shared toolkit lives in the hub skill; do not reimplement auth here.
+_TOOLKIT = Path(__file__).resolve().parent.parent.parent / "bud-platform" / "scripts"
+if str(_TOOLKIT) not in sys.path:
+    sys.path.insert(0, str(_TOOLKIT))
+
+try:
+    from budkit import BudClient, BudAPIError  # noqa: E402
+except ImportError:  # pragma: no cover
+    sys.exit(
+        f"cannot import the Bud toolkit from {_TOOLKIT}\n"
+        "Expected the bud-platform skill to be a sibling directory of this skill."
+    )
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
+
+
+# --------------------------------------------------------------------------- time
+
+
+def parse_offset(text: str) -> timezone:
+    """'+05:30', '-0800', 'UTC', 'Z' -> a fixed-offset timezone."""
+    text = text.strip()
+    if text.upper() in ("UTC", "Z", "+00:00", "0"):
+        return timezone.utc
+    m = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", text)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"bad --tz {text!r}; use a fixed offset such as +05:30 (IST) or UTC"
+        )
+    sign = 1 if m.group(1) == "+" else -1
+    return timezone(sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3))))
+
+
+def utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime(ISO_Z)
+
+
+def window_for(date_spec: str, tz: timezone) -> tuple[datetime, datetime]:
+    """Local calendar day -> [start, end) as tz-aware datetimes.
+
+    The upper bound is exclusive, which matches the agent-event endpoints and is
+    one row off on the inference endpoints (documented, not correctable).
+    """
+    midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    spec = date_spec.strip().lower()
+    if spec == "yesterday":
+        start = midnight - timedelta(days=1)
+    elif spec == "today":
+        start = midnight
+    else:
+        try:
+            day = datetime.strptime(spec, "%Y-%m-%d")
+        except ValueError:
+            raise SystemExit(f"bad --date {date_spec!r}; use YYYY-MM-DD, 'yesterday' or 'today'")
+        start = day.replace(tzinfo=tz)
+    return start, start + timedelta(days=1)
+
+
+def parse_iso(text: str) -> datetime:
+    raw = text.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        raise SystemExit(f"bad timestamp {text!r}; use ISO-8601, e.g. 2026-08-05T00:00:00Z")
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(ordered[0], 2)
+    pos = (len(ordered) - 1) * pct
+    lo, hi = int(pos), min(int(pos) + 1, len(ordered) - 1)
+    return round(ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo), 2)
+
+
+def as_text(value, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return text[:limit]
+
+
+def resolve_agent(bud: BudClient, agent: str, project_id: str | None) -> dict:
+    """Agent name or UUID -> {prompt_id, project_id, name}."""
+    params = {"page": 1, "limit": 50}
+    if UUID_RE.match(agent):
+        for row in bud.paginate("/prompts", params=params, max_items=500):
+            if str(row.get("id", "")).lower() == agent.lower():
+                return {"prompt_id": row["id"], "project_id": row.get("project_id"),
+                        "name": row.get("name")}
+        # Not in the listing (deleted or not visible) - still usable as a filter.
+        return {"prompt_id": agent, "project_id": project_id, "name": None}
+
+    matches = []
+    for row in bud.paginate("/prompts", params={**params, "search": "true", "name": agent},
+                            max_items=200):
+        if str(row.get("name", "")).lower() == agent.lower():
+            if project_id and str(row.get("project_id")) != project_id:
+                continue
+            matches.append(row)
+    if not matches:
+        # A prompt_id is NOT always a row in /prompts. Trigger-driven agents
+        # carry generated ids (prompt_1785508701957_...) that never appear in
+        # the listing, and they are often the ones worth reviewing - refusing
+        # them silently drops the worst-behaved traffic from a fleet sweep.
+        # Fall back to using the string as an observability filter directly.
+        from datetime import datetime, timedelta, timezone as _tz
+
+        _now = datetime.now(_tz.utc)
+        probe = bud.get(
+            "/metrics/observability/traces",
+            params={
+                "resource_type": "prompt",
+                "resource_id": agent,
+                "limit": 1,
+                # The endpoint requires a window; look back far enough to catch
+                # anything within the retention horizon.
+                "from_date": (_now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to_date": _now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        has_traces = bool((probe or {}).get("traces") or (probe or {}).get("items"))
+        if has_traces:
+            sys.stderr.write(
+                f"note: {agent!r} is not a named agent, but it has traces - "
+                "treating it as a raw prompt_id.\n"
+            )
+            return {"prompt_id": agent, "project_id": project_id, "name": agent}
+        raise SystemExit(
+            f"no agent named {agent!r} found, and no traces are recorded against it"
+            + (f" in project {project_id}" if project_id else "")
+            + "\nList named agents with: bud api GET /prompts -q limit=100 | jq -r '.prompts[].name'"
+            + "\nAgents that ran without being named appear in: "
+              "bud api POST /metrics/observability/events/summary -d '{\"from_date\":\"...\",\"to_date\":\"...\"}'"
+        )
+    if len(matches) > 1 and not project_id:
+        ids = ", ".join(f"{m['id']} (project {m.get('project_id')})" for m in matches)
+        raise SystemExit(f"{agent!r} is ambiguous: {ids}\nDisambiguate with --project.")
+    row = matches[0]
+    return {"prompt_id": row["id"], "project_id": row.get("project_id"), "name": row.get("name")}
+
+
+def fetch_traces(bud: BudClient, prompt_id: str, start: str, end: str, cap: int) -> list[dict]:
+    items, page, limit = [], 1, 200
+    while len(items) < cap:
+        payload = bud.get(
+            "/metrics/observability/traces",
+            params={"resource_type": "prompt", "resource_id": prompt_id,
+                    "from_date": start, "to_date": end, "page": page, "limit": limit},
+        )
+        batch = payload.get("items") or []
+        items.extend(batch)
+        total = payload.get("total_record") or 0
+        if len(batch) < limit or len(items) >= total:
+            break
+        page += 1
+    return items[:cap]
+
+
+def signature_of(trace: dict, spans: list[dict]) -> dict:
+    """Collapse one failing trace to a comparable failure signature."""
+    root_attrs = trace.get("span_attributes") or {}
+    http_status = root_attrs.get("gateway_analytics.status_code")
+    err_type = err_msg = None
+    for span in spans:
+        attrs = span.get("span_attributes") or {}
+        if span.get("status_code") == "Error" and (attrs.get("error.message") or attrs.get("error.type")):
+            err_type = attrs.get("error.type") or err_type
+            err_msg = attrs.get("error.message") or err_msg
+            if err_msg:
+                break
+    if not err_msg:
+        body = root_attrs.get("http.response.body")
+        if isinstance(body, dict):
+            err_msg = (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else None
+        elif isinstance(body, str):
+            err_msg = body[:300]
+    return {"http_status": http_status, "error_type": err_type, "error_message": err_msg}
+
+
+def normalise(message: str | None) -> str:
+    """Strip ids and numbers so two instances of the same failure group together."""
+    if not message:
+        return ""
+    text = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{20,}", "<uuid>", message, flags=re.I)
+    text = re.sub(r"\b\d+\b", "<n>", text)
+    return text.strip()[:200]
+
+
+def safe_post(bud: BudClient, path: str, body: dict) -> dict | None:
+    try:
+        return bud.post(path, json_body=body)
+    except BudAPIError as exc:
+        return {"_error": f"HTTP {exc.status}", "_detail": str(exc)[:300]}
+
+
+# --------------------------------------------------------------------------- review
+
+
+def review_window(bud: BudClient, prompt_id: str, start: str, end: str,
+                  max_detail: int, body_chars: int, deep: bool) -> dict:
+    traces = fetch_traces(bud, prompt_id, start, end, cap=2000)
+
+    durations_ms = [t.get("duration", 0) / 1e6 for t in traces]
+    errored = [t for t in traces if t.get("status_code") == "Error"]
+
+    out: dict = {
+        "window": {"from": start, "to": end},
+        "traces": {
+            "total": len(traces),
+            "errored": len(errored),
+            "error_rate": round(len(errored) / len(traces), 4) if traces else None,
+            "latency_ms": {
+                "p50": percentile(durations_ms, 0.50),
+                "p95": percentile(durations_ms, 0.95),
+                "max": round(max(durations_ms), 2) if durations_ms else None,
+            },
+        },
+    }
+
+    # HTTP status mix straight off the root spans - cheap and usually decisive.
+    status_mix: dict[str, int] = {}
+    for trace in traces:
+        code = str((trace.get("span_attributes") or {}).get("gateway_analytics.status_code", "unknown"))
+        status_mix[code] = status_mix.get(code, 0) + 1
+    out["traces"]["http_status_mix"] = dict(sorted(status_mix.items(), key=lambda kv: -kv[1]))
+
+    # Expand a bounded number of failures and group them by signature.
+    groups: dict[tuple, dict] = {}
+    for trace in errored[:max_detail] if deep else []:
+        try:
+            detail = bud.get(f"/metrics/observability/traces/{trace['trace_id']}")
+        except BudAPIError:
+            continue
+        spans = detail.get("spans") or []
+        sig = signature_of(trace, spans)
+        key = (sig["http_status"], sig["error_type"], normalise(sig["error_message"]))
+        entry = groups.setdefault(key, {
+            "http_status": sig["http_status"],
+            "error_type": sig["error_type"],
+            "error_message": sig["error_message"],
+            "count": 0,
+            "example_trace_id": trace["trace_id"],
+            "example_timestamp": trace.get("timestamp"),
+            "example_request_body": as_text(
+                (trace.get("span_attributes") or {}).get("http.request.body"), body_chars),
+            "example_response_body": as_text(
+                (trace.get("span_attributes") or {}).get("http.response.body"), body_chars),
+            "failing_spans": [s.get("span_name") for s in spans if s.get("status_code") == "Error"],
+        })
+        entry["count"] += 1
+
+    out["failure_signatures"] = sorted(groups.values(), key=lambda g: -g["count"])
+    out["failures_expanded"] = min(len(errored), max_detail) if deep else 0
+    out["failures_not_expanded"] = max(0, len(errored) - out["failures_expanded"])
+
+    # Slowest successful runs - latency drift usually hides in these, not the errors.
+    ok_traces = [t for t in traces if t.get("status_code") != "Error"]
+    ok_traces.sort(key=lambda t: t.get("duration", 0), reverse=True)
+    out["slowest_ok_traces"] = [
+        {"trace_id": t["trace_id"], "timestamp": t.get("timestamp"),
+         "duration_ms": round(t.get("duration", 0) / 1e6, 2),
+         "span_count": t.get("child_span_count")}
+        for t in ok_traces[:5]
+    ]
+
+    body = {"from_date": start, "to_date": end, "filters": {"prompt_id": prompt_id}}
+    events = safe_post(bud, "/metrics/observability/events/summary", body)
+    out["runs"] = (events or {}).get("param", {}).get("totals", events)
+
+    tools = safe_post(bud, "/metrics/observability/tools/analytics", body)
+    out["tools"] = (tools or {}).get("param", {}).get("items", tools)
+
+    tokens = safe_post(bud, "/metrics/observability/tokens/usage", body)
+    buckets = (tokens or {}).get("param", {}).get("items") or []
+    out["tokens"] = {
+        "input": sum(b.get("input_tokens", 0) for b in buckets),
+        "output": sum(b.get("output_tokens", 0) for b in buckets),
+        "total": sum(b.get("total_tokens", 0) for b in buckets),
+    }
+
+    # Execution-cost metrics force the per-request query path, so the prompt_id
+    # filter is actually applied. Asking for total_cost alone would silently
+    # return the whole installation's spend.
+    cost = safe_post(bud, "/metrics/aggregated", {
+        "from_date": start, "to_date": end,
+        "metrics": ["avg_execution_cost", "p95_execution_cost", "max_execution_cost",
+                    "avg_execution_input_tokens", "avg_execution_output_tokens"],
+        "filters": {"prompt_id": prompt_id}, "data_source": "prompt",
+    })
+    summary = (cost or {}).get("summary")
+    out["cost_per_run"] = (
+        {k: v.get("value") for k, v in summary.items()} if isinstance(summary, dict) else cost
+    )
+    return out
+
+
+def delta(current: dict, previous: dict) -> dict:
+    def pull(doc, *path):
+        node = doc
+        for key in path:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(key)
+        return node
+
+    fields = {
+        "traces_total": ("traces", "total"),
+        "traces_errored": ("traces", "errored"),
+        "trace_error_rate": ("traces", "error_rate"),
+        "latency_p95_ms": ("traces", "latency_ms", "p95"),
+        "runs_event_count": ("runs", "event_count"),
+        "runs_success_rate": ("runs", "success_rate"),
+        "runs_success_avg_latency_ms": ("runs", "success_avg_latency_ms"),
+        "tokens_total": ("tokens", "total"),
+        "avg_execution_cost": ("cost_per_run", "avg_execution_cost"),
+    }
+    out = {}
+    for label, path in fields.items():
+        now, before = pull(current, *path), pull(previous, *path)
+        row = {"current": now, "previous": before, "change": None}
+        if isinstance(now, (int, float)) and isinstance(before, (int, float)):
+            row["change"] = round(now - before, 4)
+        out[label] = row
+
+    # The analytics endpoint returns ONE ROW PER (tool_name, connector), so a
+    # tool reached through two connectors appears twice. Keying on tool_name
+    # alone silently keeps whichever row happens to come last, which both
+    # invents regressions and hides real ones. Aggregate over the pair instead.
+    def fold(rows):
+        merged: dict[str, dict] = {}
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            name = r.get("tool_name")
+            if not name:
+                continue
+            acc = merged.setdefault(
+                name, {"tool_name": name, "call_count": 0, "error_count": 0,
+                       "p95_ms": None, "connectors": []}
+            )
+            acc["call_count"] += r.get("call_count") or 0
+            acc["error_count"] += r.get("error_count") or 0
+            # No call counts to weight a percentile by, so report the worst.
+            p95 = r.get("p95_ms")
+            if isinstance(p95, (int, float)):
+                acc["p95_ms"] = p95 if acc["p95_ms"] is None else max(acc["p95_ms"], p95)
+            conn = r.get("connector")
+            if conn and conn not in acc["connectors"]:
+                acc["connectors"].append(conn)
+        return merged
+
+    tools_now = fold(current.get("tools"))
+    tools_before = fold(previous.get("tools"))
+    tool_delta = {}
+    for name in sorted(set(tools_now) | set(tools_before)):
+        a, b = tools_now.get(name, {}), tools_before.get(name, {})
+
+        def ratio(row):
+            calls = row.get("call_count") or 0
+            return round((row.get("error_count") or 0) / calls, 4) if calls else None
+
+        tool_delta[name] = {
+            "call_count": {"current": a.get("call_count"), "previous": b.get("call_count")},
+            "error_count": {"current": a.get("error_count"), "previous": b.get("error_count")},
+            "error_ratio": {"current": ratio(a), "previous": ratio(b)},
+            "p95_ms": {"current": a.get("p95_ms"), "previous": b.get("p95_ms")},
+            "connectors": a.get("connectors") or b.get("connectors") or [],
+        }
+    out["tools"] = tool_delta
+    return out
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="agent-trace-review",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--agent", required=True, metavar="NAME|UUID",
+                    help="agent (prompt) name or UUID")
+    ap.add_argument("--project", metavar="UUID",
+                    help="project UUID; needed only when an agent name is ambiguous")
+    ap.add_argument("--date", default="yesterday", metavar="SPEC",
+                    help="calendar day to review: yesterday (default), today, or YYYY-MM-DD")
+    ap.add_argument("--tz", default="UTC", metavar="OFFSET",
+                    help="timezone the calendar day is in, e.g. +05:30 for IST (default UTC). "
+                         "The window is converted to UTC before it is sent, because the API "
+                         "handles offsets inconsistently.")
+    ap.add_argument("--from", dest="from_ts", metavar="ISO",
+                    help="explicit window start; overrides --date/--tz")
+    ap.add_argument("--to", dest="to_ts", metavar="ISO",
+                    help="explicit window end; overrides --date/--tz")
+    ap.add_argument("--no-compare", action="store_true",
+                    help="skip the previous-window comparison")
+    ap.add_argument("--max-detail", type=int, default=10, metavar="N",
+                    help="failing traces to expand for error detail (default 10)")
+    ap.add_argument("--body-chars", type=int, default=1200, metavar="N",
+                    help="max characters kept from an example request/response body "
+                         "(default 1200; these contain real user content)")
+    ap.add_argument("--indent", type=int, default=2, metavar="N",
+                    help="JSON indent; 0 for one line (default 2)")
+    args = ap.parse_args()
+
+    if bool(args.from_ts) != bool(args.to_ts):
+        ap.error("--from and --to must be given together")
+
+    if args.from_ts:
+        start_dt, end_dt = parse_iso(args.from_ts), parse_iso(args.to_ts)
+        tz_label = "explicit"
+    else:
+        start_dt, end_dt = window_for(args.date, parse_offset(args.tz))
+        tz_label = args.tz
+    if end_dt <= start_dt:
+        ap.error("the window end must be after its start")
+    span = end_dt - start_dt
+
+    if not os.environ.get("BUD_API_URL"):
+        print("BUD_API_URL is not set; see the bud-platform skill for connecting.",
+              file=sys.stderr)
+
+    bud = BudClient()
+    agent = resolve_agent(bud, args.agent, args.project)
+    print(f"agent {agent['name'] or args.agent} -> {agent['prompt_id']}", file=sys.stderr)
+
+    start, end = utc(start_dt), utc(end_dt)
+    print(f"window {start} .. {end} ({tz_label})", file=sys.stderr)
+
+    report = {
+        "agent": agent,
+        "window_local_timezone": tz_label,
+        "current": review_window(bud, agent["prompt_id"], start, end,
+                                 args.max_detail, args.body_chars, deep=True),
+    }
+
+    if not args.no_compare:
+        prev_start, prev_end = utc(start_dt - span), start
+        print(f"comparing with {prev_start} .. {prev_end}", file=sys.stderr)
+        previous = review_window(bud, agent["prompt_id"], prev_start, prev_end,
+                                 args.max_detail, args.body_chars, deep=False)
+        report["previous"] = previous
+        report["delta"] = delta(report["current"], previous)
+
+    report["notes"] = [
+        "failure_signatures[].count is within the expanded sample only; "
+        "failures_not_expanded says how many failures were not opened. Raise "
+        "--max-detail if you need the true incidence per signature.",
+        "duration/latency values are milliseconds; the raw trace API reports nanoseconds.",
+        "cost_per_run uses execution-cost metrics, which force the per-request query "
+        "path so the prompt_id filter is honoured.",
+        "runs.* counts agent invocations; traces.* counts inbound requests - they can "
+        "differ legitimately.",
+        "example bodies contain real user content; summarise rather than republishing.",
+    ]
+
+    json.dump(report, sys.stdout, indent=(args.indent or None), ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except BudAPIError as exc:
+        print(f"bud API error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

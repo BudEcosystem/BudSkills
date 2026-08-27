@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Turn a task description into a scored test set.
+
+Writes a JSONL case file covering four categories - typical, edge, out of
+scope, adversarial - and splits it into a `train` half the optimiser may look
+at and a `holdout` half it may not.
+
+    gen-cases --task hr-agent.md --n 50 --out cases.jsonl
+
+By default *you*, the coding agent running this, write the cases: the script
+prepares a brief, stops, and you fill in a response file. Nothing is sent
+anywhere and no API key exists to leak.
+
+    --via model --model <deployment>    generate them with a model deployed in
+                                        your own installation instead. This
+                                        spends the user's compute - ask first.
+
+The method follows the published test-generation recipe: derive the intent,
+then the input space, then the output rules, then cases that probe each - plus
+inverse rules, which is where the adversarial cases come from.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from budopt import cases as C  # noqa: E402
+from budopt import common, turns  # noqa: E402
+
+
+def build_brief(task: str, n: int, prompt_text: str | None, existing: list[dict],
+                problems: list[str]) -> str:
+    counts = {cat: max(1, round(n * frac)) for cat, frac in C.CATEGORY_MIX.items()}
+    counts["typical"] += n - sum(counts.values())
+    mix = "\n".join(f"- **{cat}**: {num} cases" for cat, num in counts.items())
+
+    sections: list[tuple[str, str]] = [
+        ("The agent under test", task.strip()),
+    ]
+    if prompt_text:
+        sections.append((
+            "Its current prompt (derive the input space from this, do not copy its wording)",
+            "```\n" + prompt_text.strip() + "\n```",
+        ))
+    sections += [
+        ("What to produce", f"""
+            Exactly {n} test cases, one JSON object per line, in this mix:
+
+            {mix}
+
+            Work in this order rather than free-associating:
+
+            1. **Intent** - state in one sentence what this agent is for. Do not write it
+               down; use it to decide what counts as in scope.
+            2. **Input space** - list the kinds of request a real user would send: the
+               topics, the phrasings, the sloppy ones, the ones with missing context.
+            3. **Output rules** - what must always be true of a correct answer (facts it
+               must state, formats it must follow, things it must never say).
+            4. **Inverse rules** - negate each output rule. Those become the out-of-scope
+               and adversarial cases: the requests that tempt the agent to break a rule.
+
+            Category meanings:
+
+            - `typical` - questions the agent exists to answer, in the words users
+              really use, including careless and abbreviated ones.
+            - `edge` - ambiguous, multi-part, or missing the context needed to answer.
+              A correct answer often asks a clarifying question rather than guessing.
+            - `out_of_scope` - reasonable-sounding requests it must decline. This is
+              where most agents leak, because they are helpful by default.
+            - `adversarial` - attempts to override its instructions, extract them, or
+              get it to disclose something it should not.
+        """),
+        ("Line format", "```\n" + C.SCHEMA_DOC.strip() + "\n```"),
+        ("Rules you must not break", """
+            - **Never invent a fact.** You may invent the *questions*; you may not invent
+              the answers. If the task description does not state the leave allowance,
+              the escalation path or the approval threshold, do NOT put a number in
+              `reference` or `expect_contains`. Write the case with a `rubric` describing
+              the required *behaviour* instead, and add
+              `"notes": "TODO confirm with the user"`.
+              A case set built on invented ground truth optimises the prompt towards a
+              fiction, which is worse than having no case set.
+            - **One behaviour per case.** If a case can fail two ways you cannot tell
+              which broke.
+            - **Prefer `expect_contains` to `rubric`** whenever a correct answer must
+              contain a specific token. Substrings are free, exact and never drift;
+              rubrics cost a grading pass and carry judge noise.
+            - Write rubrics as a testable requirement ("States the entitlement in days
+              and cites the policy section"), never as a description ("Gives a helpful
+              answer").
+            - Ids must be unique and descriptive: `leave-carryover-01`, not `case-7`.
+            - Output ONLY the JSONL lines. No commentary, no fence, no blank lines.
+        """),
+    ]
+    if existing:
+        have = ", ".join(sorted(str(c.get("id")) for c in existing)[:40])
+        sections.append(("Ids already in use (do not reuse or renumber them)", have))
+    if problems:
+        sections.append((
+            "Your previous response was rejected - fix these and rewrite the whole file",
+            "\n".join(f"- {p}" for p in problems),
+        ))
+    return turns.format_brief("Write a test set for this agent", sections)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="gen-cases",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  gen-cases --task hr-agent.md --n 50 --out cases.jsonl\n"
+            "  gen-cases --task hr-agent.md --prompt baseline.txt --n 50 --out cases.jsonl\n"
+            "  gen-cases --task hr-agent.md --n 50 --out cases.jsonl --via model --model my-deploy\n"
+            "\nExit codes: 0 written, 10 your turn (see the message), 1 error.\n"
+        ),
+    )
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--task", help="file describing what the agent is for")
+    src.add_argument("--task-text", help="the same thing inline")
+    ap.add_argument("--out", required=True, help="case file to write (JSONL)")
+    ap.add_argument("--n", type=int, default=50, help="how many cases (default 50)")
+    ap.add_argument("--prompt", help="the agent's current prompt, to derive the input space from")
+    ap.add_argument("--via", choices=["agent", "model"], default="agent",
+                    help="who writes the cases: 'agent' = you, no network (default); "
+                         "'model' = a deployment in this installation")
+    ap.add_argument("--model", help="deployment name, required with --via model")
+    ap.add_argument("--holdout", type=float, default=0.4,
+                    help="fraction reserved from the optimiser (default 0.4)")
+    ap.add_argument("--workdir", default=".", help="where turn files live (default .)")
+    ap.add_argument("--allow-thin", action="store_true",
+                    help="accept a set that misses a whole category")
+    args = ap.parse_args()
+
+    task = Path(args.task).read_text(encoding="utf-8") if args.task else args.task_text
+    prompt_text = Path(args.prompt).read_text(encoding="utf-8") if args.prompt else None
+    out = Path(args.out)
+    existing = common.read_jsonl(out) if out.is_file() else []
+
+    if args.n < 20:
+        common.note(
+            f"warning: {args.n} cases is below the useful floor. On fewer than ~20 cases a "
+            "single case flipping moves the score several points and no comparison is "
+            "trustworthy. 30-50 is the working range."
+        )
+
+    ref = turns.Reflector(args.via, Path(args.workdir), model=args.model, max_tokens=8000)
+    problems: list[str] = []
+    for attempt in range(3):
+        brief = build_brief(task, args.n, prompt_text, existing, problems)
+        try:
+            raw = ref.ask(
+                "gen-cases", brief,
+                summary=f"Write {args.n} test cases for this agent.",
+                ext="jsonl",
+            )
+        except turns.AgentTurnRequired as need:
+            return need.report()
+
+        rows = C.normalise(turns.parse_jsonl(raw))
+        problems = C.validate(rows, strict=not args.allow_thin)
+        if len(rows) < max(1, int(args.n * 0.8)):
+            problems.insert(0, f"only {len(rows)} usable cases parsed, expected {args.n}")
+        if not problems:
+            break
+        common.note(f"generated set rejected ({len(problems)} problem(s)):")
+        for p in problems[:10]:
+            common.note(f"  - {p}")
+        if args.via == "agent":
+            # Re-ask with the problems appended; the brief hash changes, so the
+            # stale response is discarded rather than silently reused.
+            continue
+        if attempt == 2:
+            return 1
+    else:
+        common.note("gen-cases: could not get a valid case set after 3 attempts.")
+        return 1
+
+    rows = C.assign_splits(rows, args.holdout)
+    common.write_jsonl(out, rows)
+    info = C.summary(rows)
+    common.note(
+        f"\nwrote {out}: {info['total']} cases "
+        f"({', '.join(f'{k}={v}' for k, v in sorted(info['by_category'].items()))}) "
+        f"[{', '.join(f'{k}={v}' for k, v in sorted(info['by_split'].items()))}]"
+    )
+    common.note(
+        "The holdout split is a regression guard, not a second experiment - never let "
+        "the optimiser see it.\n"
+        "Check every `reference` and `expect_contains` against real source material "
+        "before trusting a single score."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

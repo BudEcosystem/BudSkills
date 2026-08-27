@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Compare two scored runs per case, and refuse to call a coin-flip a win.
+
+    guard --baseline runs/v1.json --candidate runs/v2.json
+
+Averages hide the damage you are trying to avoid: a candidate that fixes one
+case and breaks another looks identical on the mean and is strictly worse if
+the broken one mattered. So this reports the four cells that actually carry
+information - fixed, broken, both right, both wrong - and tests the difference
+properly.
+
+Because both prompts ran on the same cases, the comparison is *paired*, and the
+right test is McNemar's exact test on the discordant cases. That test is
+unforgiving about small suites, which is the point:
+
+    on 50 cases you need 6 clean fixes and no regressions to clear p < 0.05.
+    One case in fifty is 2 percentage points and p = 1.0. It is not a result.
+
+Exit codes:  0 ship it   1 something regressed   2 no detectable difference
+             3 the two runs are not comparable
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from budopt import common, stats  # noqa: E402
+
+
+def verdict_map(run: dict) -> dict[str, bool]:
+    out: dict[str, bool] = {}
+    for row in run.get("results") or []:
+        if "verdict" not in row:
+            raise SystemExit(
+                "guard: this run has not been scored yet. Run score-run on it first."
+            )
+        out[str(row["id"])] = row["verdict"] == "PASS"
+    return out
+
+
+def comparability(base: dict, cand: dict) -> list[str]:
+    """Reasons these two runs cannot be honestly compared."""
+    blockers = []
+    bj = (base.get("score") or {}).get("judge")
+    cj = (cand.get("score") or {}).get("judge")
+    if bj != cj:
+        blockers.append(
+            f"different judges ({bj} vs {cj}) - you changed the ruler, not the thing "
+            "being measured. Re-score both with the same judge."
+        )
+    if base.get("cases_file") != cand.get("cases_file"):
+        blockers.append(
+            f"different case files ({base.get('cases_file')} vs {cand.get('cases_file')})"
+        )
+    if base.get("split") != cand.get("split"):
+        blockers.append(f"different splits ({base.get('split')} vs {cand.get('split')})")
+    return blockers
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="guard",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  guard --baseline runs/v1-train.json --candidate runs/v2-train.json\n"
+            "  guard --baseline runs/v1-holdout.json --candidate runs/v2-holdout.json --strict\n"
+        ),
+    )
+    ap.add_argument("--baseline", required=True, help="scored run of the current best")
+    ap.add_argument("--candidate", required=True, help="scored run of the challenger")
+    ap.add_argument("--alpha", type=float, default=0.05, help="significance level (default 0.05)")
+    ap.add_argument("--allow-regressions", action="store_true",
+                    help="do not fail on regressions (only when the user has accepted the trade)")
+    ap.add_argument("--strict", action="store_true",
+                    help="also fail when the improvement is not statistically detectable")
+    ap.add_argument("--json", dest="as_json", action="store_true", help="machine-readable output")
+    ap.add_argument("--force", action="store_true", help="compare anyway, despite blockers")
+    args = ap.parse_args()
+
+    base = common.read_json(args.baseline)
+    cand = common.read_json(args.candidate)
+
+    blockers = comparability(base, cand)
+    if blockers and not args.force:
+        print("NOT COMPARABLE - refusing to report a delta:")
+        for b in blockers:
+            print(f"  - {b}")
+        print("\nFix the mismatch, or pass --force if you know why it is fine.")
+        return 3
+
+    bv, cv = verdict_map(base), verdict_map(cand)
+    cells = stats.paired_counts(bv, cv)
+    shared = cells["shared"]
+    if not shared:
+        print("NOT COMPARABLE - the two runs share no case ids.")
+        return 3
+
+    fixed, broken = cells["fixed"], cells["broken"]
+    b_pass = sum(1 for c in shared if bv[c])
+    c_pass = sum(1 for c in shared if cv[c])
+    n = len(shared)
+    p = stats.mcnemar_exact(len(fixed), len(broken))
+    delta = (c_pass - b_pass) / n
+    floor = stats.detectable_delta(n, args.alpha)
+    b_lo, b_hi = stats.wilson_interval(b_pass, n)
+    c_lo, c_hi = stats.wilson_interval(c_pass, n)
+
+    significant = p <= args.alpha
+    if broken and not args.allow_regressions:
+        verdict, code = "REGRESSION - do not ship", 1
+    elif significant and c_pass > b_pass:
+        verdict, code = "SHIP - improvement is real", 0
+    elif significant and c_pass < b_pass:
+        verdict, code = "WORSE - the candidate is significantly worse", 1
+    else:
+        verdict, code = "NO DETECTABLE DIFFERENCE", (2 if args.strict else 0)
+
+    report = {
+        "verdict": verdict,
+        "cases_compared": n,
+        "baseline": {"target": base.get("target"), "passed": b_pass,
+                     "pass_rate": round(b_pass / n, 4), "ci95": [round(b_lo, 4), round(b_hi, 4)]},
+        "candidate": {"target": cand.get("target"), "passed": c_pass,
+                      "pass_rate": round(c_pass / n, 4), "ci95": [round(c_lo, 4), round(c_hi, 4)]},
+        "delta": round(delta, 4),
+        "fixed": fixed,
+        "broken": broken,
+        "mcnemar_p": round(p, 4),
+        "alpha": args.alpha,
+        "significant": significant,
+        "smallest_detectable_delta": round(floor, 4),
+        "min_clean_fixes_needed": stats.min_clean_fixes(args.alpha),
+        "unmatched": {"only_in_baseline": cells["only_in_baseline"],
+                      "only_in_candidate": cells["only_in_candidate"]},
+    }
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+        return code
+
+    print(f"{verdict}\n")
+    print(f"  cases compared   {n}")
+    print(f"  baseline         {b_pass}/{n} = {b_pass / n * 100:5.1f}%  "
+          f"(95% CI {b_lo * 100:.0f}-{b_hi * 100:.0f}%)   {base.get('target')}")
+    print(f"  candidate        {c_pass}/{n} = {c_pass / n * 100:5.1f}%  "
+          f"(95% CI {c_lo * 100:.0f}-{c_hi * 100:.0f}%)   {cand.get('target')}")
+    print(f"  delta            {delta * 100:+.1f} pp")
+    print(f"  fixed            {len(fixed)}   {', '.join(fixed[:8])}{' ...' if len(fixed) > 8 else ''}")
+    print(f"  broken           {len(broken)}   {', '.join(broken[:8])}{' ...' if len(broken) > 8 else ''}")
+    print(f"  both already ok  {len(cells['both_pass'])}")
+    print(f"  both still wrong {len(cells['both_fail'])}")
+    print(f"\n  McNemar exact p = {p:.4f} (alpha {args.alpha})")
+
+    if not significant:
+        print(
+            f"\n  Only the {len(fixed) + len(broken)} discordant case(s) carry information, and "
+            f"that is not enough.\n"
+            f"  On {n} cases the smallest delta that could ever reach p<{args.alpha} is "
+            f"{floor * 100:.0f} pp\n"
+            f"  ({report['min_clean_fixes_needed']} clean fixes, no regressions). Treat this "
+            f"as a tie."
+        )
+    if broken:
+        print(
+            f"\n  {len(broken)} case(s) that used to pass now fail. An unchanged or improved "
+            "average\n  does not make that acceptable - decide explicitly whether the trade is "
+            "worth it,\n  and say so to the user rather than resolving it silently."
+        )
+    if cells["only_in_baseline"] or cells["only_in_candidate"]:
+        print(
+            f"\n  warning: {len(cells['only_in_baseline'])} case(s) only in the baseline and "
+            f"{len(cells['only_in_candidate'])} only in the candidate were ignored. "
+            "Renaming a case id makes a regression look like a new case."
+        )
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

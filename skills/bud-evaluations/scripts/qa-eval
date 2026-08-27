@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Score your own question/answer cases against Bud deployments or prompt versions.
+
+Bud's built-in evaluation subsystem only runs *catalog* datasets against
+*deployed model endpoints*. When the cases are your own - "50 HR question/answer
+pairs I wrote" - or the thing under test is an agent prompt version rather than
+an endpoint, run them through the inference gateway and score them here.
+
+Targets are gateway model names:
+
+    my-deployment          a deployed model endpoint
+    prompt:hr-agent        an agent, its default prompt version
+    prompt:hr-agent:v3     an agent, prompt version 3 specifically
+
+Stdlib only. See --help.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+DEFAULT_TIMEOUT = 120
+RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+
+# ---------------------------------------------------------------- cases
+
+def load_cases(path: str) -> list[dict]:
+    """Read cases from JSONL, a JSON array, or CSV.
+
+    Required per case: 'input' (the question) and 'expected' (the reference
+    answer, or the substring/regex to look for). Optional: 'id', 'scorer',
+    'instructions', 'weight'.
+    """
+    raw = open(path, encoding="utf-8").read().strip()
+    if not raw:
+        raise SystemExit(f"qa-eval: {path} is empty")
+
+    if path.endswith(".csv"):
+        rows: list[dict] = list(csv.DictReader(raw.splitlines()))
+    elif raw.lstrip().startswith("["):
+        rows = json.loads(raw)
+    else:
+        rows = []
+        for n, line in enumerate(raw.splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("//"):
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"qa-eval: {path} line {n} is not valid JSON: {exc}") from None
+
+    cases = []
+    for i, row in enumerate(rows, 1):
+        # Accept the obvious synonyms so a hand-written file just works.
+        question = row.get("input") or row.get("question") or row.get("prompt")
+        answer = row.get("expected")
+        if answer is None:
+            answer = row.get("answer") or row.get("output") or row.get("reference")
+        if not question:
+            raise SystemExit(f"qa-eval: case {i} has no 'input' field")
+        if answer is None:
+            raise SystemExit(f"qa-eval: case {i} ({str(question)[:40]!r}) has no 'expected' field")
+        cases.append({
+            "id": str(row.get("id") or i),
+            "input": str(question),
+            "expected": str(answer),
+            "scorer": row.get("scorer"),
+            "instructions": row.get("instructions"),
+            "weight": float(row.get("weight") or 1),
+        })
+    return cases
+
+
+# ---------------------------------------------------------------- gateway
+
+def call_gateway(base: str, token: str, path: str, body: dict, timeout: int, retries: int = 4) -> dict:
+    url = base.rstrip("/") + path
+    data = json.dumps(body).encode()
+    delay, last = 1.0, ""
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:300]}"
+            if exc.code == 401:
+                raise SystemExit(
+                    "qa-eval: 401 from the gateway. Mint AND register a token with "
+                    "`export BUD_GATEWAY_TOKEN=$(bud token)` - an unregistered token "
+                    "always reads as an invalid key."
+                ) from None
+            if exc.code not in RETRY_STATUSES or attempt == retries:
+                return {"__error__": last}
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            if attempt == retries:
+                return {"__error__": last}
+        time.sleep(delay)
+        delay = min(delay * 2, 20)
+    return {"__error__": last}
+
+
+def uses_responses_api(target: str, mode: str) -> bool:
+    if mode == "responses":
+        return True
+    if mode == "chat":
+        return False
+    return target.startswith("prompt:")  # agents are published on the responses API
+
+
+def extract_responses_text(out: dict) -> str:
+    """Pull assistant text out of a Responses-API payload."""
+    if isinstance(out.get("output_text"), str):
+        return out["output_text"]
+    chunks = []
+    for item in out.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chunks.append(part["text"])
+    return "\n".join(chunks).strip()
+
+
+def ask(target: str, question: str, args: argparse.Namespace, instructions: str | None) -> tuple[str, str | None]:
+    """Send one question to one target. Returns (text, error)."""
+    if uses_responses_api(target, args.api):
+        body: dict[str, Any] = {"input": question}
+        if target.startswith("prompt:"):
+            # An agent is addressed by an object, NOT by a "prompt:<name>" model
+            # name -- that form returns 404 "not found or does not support
+            # responses" and would make every case fail without testing anything.
+            parts = target.split(":")
+            ref: dict[str, Any] = {"id": parts[1]}
+            if len(parts) > 2 and parts[2].lstrip("v").isdigit():
+                ref["version"] = int(parts[2].lstrip("v"))
+            body["prompt"] = ref
+        else:
+            body["model"] = target
+        if instructions:
+            body["instructions"] = instructions
+        if args.max_tokens:
+            body["max_output_tokens"] = args.max_tokens
+        if args.temperature is not None:
+            body["temperature"] = args.temperature
+        out = call_gateway(args.gateway, args.token, "/v1/responses", body, args.timeout)
+        if "__error__" in out:
+            return "", out["__error__"]
+        return extract_responses_text(out), None
+
+    messages = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    messages.append({"role": "user", "content": question})
+    body = {"model": target, "messages": messages}
+    if args.max_tokens:
+        body["max_tokens"] = args.max_tokens
+    if args.temperature is not None:
+        body["temperature"] = args.temperature
+    out = call_gateway(args.gateway, args.token, "/v1/chat/completions", body, args.timeout)
+    if "__error__" in out:
+        return "", out["__error__"]
+    try:
+        return out["choices"][0]["message"]["content"] or "", None
+    except (KeyError, IndexError, TypeError):
+        return "", f"unexpected response shape: {json.dumps(out)[:200]}"
+
+
+# ---------------------------------------------------------------- scoring
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower().rstrip(".")
+
+
+JUDGE_TEMPLATE = """You are grading one answer against a reference answer.
+
+Question:
+{question}
+
+Reference answer:
+{expected}
+
+Candidate answer:
+{actual}
+
+Is the candidate answer correct and consistent with the reference? Ignore
+wording, formatting and extra detail; judge only whether the substance matches
+and nothing in the candidate contradicts the reference.
+
+Reply with exactly one line: PASS or FAIL, then a semicolon and a short reason.
+"""
+
+
+def score_case(case: dict, actual: str, args: argparse.Namespace) -> tuple[float, str]:
+    scorer = case.get("scorer") or args.score
+    expected = case["expected"]
+
+    if scorer == "exact":
+        return (1.0 if normalize(actual) == normalize(expected) else 0.0), "exact"
+    if scorer == "contains":
+        return (1.0 if normalize(expected) in normalize(actual) else 0.0), "contains"
+    if scorer == "regex":
+        try:
+            hit = re.search(expected, actual, re.IGNORECASE | re.DOTALL) is not None
+        except re.error as exc:
+            return 0.0, f"bad regex: {exc}"
+        return (1.0 if hit else 0.0), "regex"
+    if scorer == "judge":
+        judge = args.judge_target or args.targets[0]
+        prompt = args.judge_template.format(question=case["input"], expected=expected, actual=actual or "(empty)")
+        verdict, err = ask(judge, prompt, args, None)
+        if err:
+            return 0.0, f"judge error: {err}"
+        head = verdict.strip().splitlines()[0] if verdict.strip() else ""
+        return (1.0 if head.upper().startswith("PASS") else 0.0), f"judge: {head[:120]}"
+    raise SystemExit(f"qa-eval: unknown scorer {scorer!r}")
+
+
+# ---------------------------------------------------------------- run
+
+def run_target(target: str, cases: list[dict], args: argparse.Namespace) -> list[dict]:
+    def one(case: dict) -> dict:
+        started = time.time()
+        actual, err = ask(target, case["input"], args, case.get("instructions") or args.instructions)
+        elapsed = round(time.time() - started, 3)
+        if err:
+            return {**case, "target": target, "actual": "", "score": 0.0,
+                    "detail": err, "error": err, "seconds": elapsed}
+        score, detail = score_case(case, actual, args)
+        return {**case, "target": target, "actual": actual, "score": score,
+                "detail": detail, "error": None, "seconds": elapsed}
+
+    with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+        return list(pool.map(one, cases))
+
+
+def summarize(results: list[dict]) -> dict:
+    total_weight = sum(r["weight"] for r in results) or 1
+    passed = sum(r["score"] * r["weight"] for r in results)
+    lat = sorted(r["seconds"] for r in results)
+    return {
+        "cases": len(results),
+        "passed": round(passed, 2),
+        "accuracy": round(passed / total_weight, 4),
+        "errors": sum(1 for r in results if r["error"]),
+        "median_seconds": lat[len(lat) // 2] if lat else 0,
+    }
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="qa-eval",
+        description="Score your own question/answer cases against Bud deployments or agent prompt versions.",
+        epilog=(
+            "Example - which prompt version answers HR questions best:\n"
+            "  export BUD_GATEWAY_URL=https://gateway.example.bud.studio\n"
+            "  export BUD_GATEWAY_TOKEN=$(bud token)\n"
+            "  qa-eval --cases hr.jsonl --target prompt:hr-agent:v1 --target prompt:hr-agent:v2 \\\n"
+            "          --score judge --judge-target my-strong-deployment --out results.json\n\n"
+            "Case file (JSONL, one object per line):\n"
+            '  {"id":"pto-01","input":"How many days of PTO do I get?",\n'
+            '   "expected":"25 days per year","scorer":"contains"}\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--cases", required=True, help="JSONL, JSON array or CSV file of cases")
+    p.add_argument("--target", dest="targets", action="append", required=True,
+                   help="gateway model name; repeat to compare (e.g. prompt:hr-agent:v2)")
+    p.add_argument("--gateway", default=os.environ.get("BUD_GATEWAY_URL"),
+                   help="inference gateway origin (env BUD_GATEWAY_URL)")
+    p.add_argument("--token", default=os.environ.get("BUD_GATEWAY_TOKEN"),
+                   help="bearer token from `bud token` (env BUD_GATEWAY_TOKEN)")
+    p.add_argument("--api", choices=["auto", "chat", "responses"], default="auto",
+                   help="auto = responses for prompt:* targets, chat completions otherwise")
+    p.add_argument("--score", choices=["exact", "contains", "regex", "judge"], default="contains",
+                   help="default scorer; a case's own 'scorer' field overrides it")
+    p.add_argument("--judge-target", help="gateway model name used to grade when scorer=judge")
+    p.add_argument("--judge-prompt", help="file with a judge template using {question} {expected} {actual}")
+    p.add_argument("--instructions", help="system prompt applied to every case (a case's own wins)")
+    p.add_argument("--concurrency", type=int, default=2, help="parallel requests per target (default 2)")
+    p.add_argument("--max-cases", type=int, help="run only the first N cases (smoke run)")
+    p.add_argument("--max-tokens", type=int, default=512)
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="omitted unless set; some deployments reject an explicit temperature",
+    )
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument("--out", help="write full per-case results to this JSON file")
+    p.add_argument("--csv", help="write per-case results to this CSV file")
+    args = p.parse_args()
+
+    if not args.gateway:
+        p.error("no gateway origin: pass --gateway or set BUD_GATEWAY_URL. It is a different host "
+                "from the Bud API - usually gateway.<same domain>.")
+    if not args.token:
+        p.error("no token: run `export BUD_GATEWAY_TOKEN=$(bud token)`")
+    args.judge_template = open(args.judge_prompt, encoding="utf-8").read() if args.judge_prompt else JUDGE_TEMPLATE
+    if args.score == "judge" and not args.judge_target:
+        print("qa-eval: warning - scorer=judge without --judge-target lets the first target mark "
+              "its own work; pass a separate, stronger deployment.", file=sys.stderr)
+
+    cases = load_cases(args.cases)
+    if args.max_cases:
+        cases = cases[: args.max_cases]
+    print(f"qa-eval: {len(cases)} cases x {len(args.targets)} target(s)", file=sys.stderr)
+
+    all_results: list[dict] = []
+    summaries: dict[str, dict] = {}
+    for target in args.targets:
+        print(f"  -> {target}", file=sys.stderr)
+        results = run_target(target, cases, args)
+        all_results.extend(results)
+        summaries[target] = summarize(results)
+
+    width = max(len(t) for t in args.targets)
+    print(f"\n{'target'.ljust(width)}  accuracy   passed  errors  median s")
+    for target, s in sorted(summaries.items(), key=lambda kv: -kv[1]["accuracy"]):
+        print(f"{target.ljust(width)}  {s['accuracy'] * 100:7.1f}%  {s['passed']:7}  "
+              f"{s['errors']:6}  {s['median_seconds']:8}")
+
+    if len(args.targets) > 1:
+        by_case: dict[str, dict[str, float]] = {}
+        for r in all_results:
+            by_case.setdefault(r["id"], {})[r["target"]] = r["score"]
+        split = [cid for cid, scores in by_case.items() if len(set(scores.values())) > 1]
+        if split:
+            print(f"\n{len(split)} case(s) where targets disagree - read these first: "
+                  f"{', '.join(split[:20])}{' ...' if len(split) > 20 else ''}")
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump({"summary": summaries, "results": all_results}, fh, indent=2)
+        print(f"\nwrote {args.out}", file=sys.stderr)
+    if args.csv:
+        cols = ["target", "id", "input", "expected", "actual", "score", "detail", "error", "seconds"]
+        with open(args.csv, "w", encoding="utf-8", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols)
+            w.writeheader()
+            for r in all_results:
+                w.writerow({k: r.get(k) for k in cols})
+        print(f"wrote {args.csv}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

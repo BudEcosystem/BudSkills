@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Submit a Bud Foundry cluster onboarding and, optionally, watch it finish.
+
+Why this exists: the onboarding endpoint is multipart/form-data with a file
+upload (the kubeconfig), which `bud api` cannot express - it speaks JSON. This
+script builds the multipart body, reuses the same authenticated session,
+CSRF handling and retries as `bud`, and applies the one rule that hand-rolled
+polling always gets wrong: a cluster onboarding whose step FAILED keeps
+reporting `status: in_progress` forever, so only the per-step states are
+trustworthy.
+
+Examples
+--------
+  # existing Kubernetes/OpenShift cluster, single shot, wait for it
+  cluster-onboard --name lab-a100 --icon "\N{BRAIN}" \\
+      --ingress-url http://10.0.4.20 --kubeconfig ./kubeconfig.yaml \\
+      --wait --timeout 1800
+
+  # see exactly what would be sent, send nothing
+  cluster-onboard --name lab-a100 --kubeconfig ./kc.yaml --dry-run
+
+  # provision a managed cluster (azure/aws only)
+  cluster-onboard --type CLOUD --name prod-eu --icon "\N{CLOUD}" \\
+      --credential-id <uuid> --provider-id <uuid> --region westeurope --wait
+
+  # step-wise: open a session, then advance it
+  cluster-onboard --name lab --icon "\N{BRAIN}" --no-trigger --total-steps 3
+  cluster-onboard --workflow-id <id> --step 2 --kubeconfig ./kc.yaml \\
+      --ingress-url http://10.0.4.20 --no-trigger
+  cluster-onboard --workflow-id <id> --step 3          # triggers
+
+  # watch an onboarding that is already running
+  cluster-onboard --watch <workflow-id> --timeout 1800
+
+This mutates a real cluster. Confirm the target with the user first.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import pathlib
+import shutil
+import sys
+import time
+import uuid
+
+# --- locate the shared toolkit (installed with the bud-platform skill) -------
+
+
+def _budkit_candidates() -> list[str]:
+    here = pathlib.Path(__file__).resolve().parent
+    out = []
+    if os.environ.get("BUDKIT_PATH"):
+        out.append(os.environ["BUDKIT_PATH"])
+    # sibling skill: <skills>/bud-clusters/scripts -> <skills>/bud-platform/scripts
+    out.append(str(here.parent.parent / "bud-platform" / "scripts"))
+    launcher = shutil.which("bud")
+    if launcher:
+        out.append(str(pathlib.Path(launcher).resolve().parent))
+    return out
+
+
+for _candidate in _budkit_candidates():
+    if (pathlib.Path(_candidate) / "budkit").is_dir():
+        sys.path.insert(0, _candidate)
+        break
+
+try:
+    from budkit.client import BudClient
+    from budkit.errors import BudAPIError
+except ImportError:  # pragma: no cover
+    sys.exit(
+        "cannot import budkit - install the bud-platform skill's toolkit, or set\n"
+        "BUDKIT_PATH to the directory containing budkit/ (see bud-platform)."
+    )
+
+
+ONPREM_STEPS = [
+    "determine_cluster_platform",
+    "check_duplicate_config",
+    "verify_cluster_connection",
+    "configure_cluster",
+    "fetch_cluster_info",
+]
+CLOUD_STEPS = [
+    "create_cloud_provider_cluster",
+    "verify_cluster_connection",
+    "configure_cluster",
+    "fetch_cluster_info",
+]
+
+
+# --- multipart ---------------------------------------------------------------
+
+
+def encode_multipart(
+    fields: dict[str, str], files: dict[str, pathlib.Path]
+) -> tuple[bytes, str]:
+    """Build a multipart/form-data body. Returns (body, content_type)."""
+    boundary = "----budskillform" + uuid.uuid4().hex
+    out = bytearray()
+    for name, value in fields.items():
+        out += f"--{boundary}\r\n".encode()
+        out += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        out += f"{value}\r\n".encode()
+    for name, path in files.items():
+        ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        out += f"--{boundary}\r\n".encode()
+        out += f'Content-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'.encode()
+        out += f"Content-Type: {ctype}\r\n\r\n".encode()
+        out += path.read_bytes()
+        out += b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
+
+
+# --- waiting -----------------------------------------------------------------
+
+
+def step_states(workflow: dict) -> list[tuple[str, str, str]]:
+    """Return [(step_id, status, message)] from a workflow detail response."""
+    steps_holder = (workflow.get("workflow_steps") or {}).get(
+        "create_cluster_events"
+    ) or {}
+    rows = []
+    for step in steps_holder.get("steps") or []:
+        content = (step.get("payload") or {}).get("content") or {}
+        rows.append(
+            (
+                str(step.get("id")),
+                str(content.get("status") or "PENDING").upper(),
+                str(content.get("message") or step.get("title") or ""),
+            )
+        )
+    return rows
+
+
+def watch(client: BudClient, workflow_id: str, timeout: int, interval: int = 10) -> int:
+    """Poll until every step completes or one fails. Returns a process exit code."""
+    deadline = time.time() + timeout
+    seen: dict[str, str] = {}
+    while True:
+        try:
+            wf = client.get(f"/workflows/{workflow_id}")
+        except BudAPIError as exc:
+            print(f"! cannot read workflow: {exc}", file=sys.stderr)
+            return 2
+        rows = step_states(wf)
+        for step_id, status, message in rows:
+            if seen.get(step_id) != status and status != "PENDING":
+                print(f"  {status:<9} {step_id}  {message}", file=sys.stderr)
+                seen[step_id] = status
+        failed = [r for r in rows if r[1] == "FAILED"]
+        if failed:
+            step_id, _, message = failed[0]
+            print(
+                f"onboarding FAILED at {step_id}: {message}\n"
+                "No later step will run and the workflow status stays in_progress.\n"
+                "Do not resubmit the same kubeconfig - read the message first.",
+                file=sys.stderr,
+            )
+            return 1
+        cluster_id = (wf.get("workflow_steps") or {}).get("cluster_id")
+        done = rows and all(r[1] == "COMPLETED" for r in rows)
+        if done or (cluster_id and wf.get("status") == "completed"):
+            print(
+                json.dumps(
+                    {
+                        "workflow_id": workflow_id,
+                        "cluster_id": cluster_id,
+                        "status": "completed",
+                    },
+                    indent=2,
+                )
+            )
+            if cluster_id:
+                print(
+                    f"next: bud wait resource /clusters/{cluster_id} --field status --equals available",
+                    file=sys.stderr,
+                )
+            return 0
+        if wf.get("status") == "failed":
+            print(f"workflow failed: {wf.get('reason')}", file=sys.stderr)
+            return 1
+        if time.time() > deadline:
+            print(
+                f"timed out after {timeout}s - the installation may still be running.\n"
+                f"resume with: {sys.argv[0]} --watch {workflow_id}",
+                file=sys.stderr,
+            )
+            return 3
+        time.sleep(interval)
+
+
+# --- main --------------------------------------------------------------------
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="cluster-onboard",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--name", help="cluster name, unique case-insensitively (1-100 chars)"
+    )
+    p.add_argument(
+        "--icon", default="\N{GLOBE WITH MERIDIANS}", help="emoji shown in the console"
+    )
+    p.add_argument(
+        "--ingress-url",
+        help="http(s) URL Bud reaches the cluster on (required for ON_PREM)",
+    )
+    p.add_argument(
+        "--kubeconfig",
+        help="path to a kubeconfig YAML with cluster-admin (required for ON_PREM)",
+    )
+    p.add_argument(
+        "--type",
+        "--cluster-type",
+        dest="type",
+        default="ON_PREM",
+        choices=["ON_PREM", "CLOUD"],
+        help="default ON_PREM",
+    )
+    p.add_argument("--credential-id", help="stored cloud credential id (CLOUD)")
+    p.add_argument(
+        "--provider-id", help="cloud provider id (CLOUD); only azure and aws work"
+    )
+    p.add_argument(
+        "--region", help="cloud region id, e.g. westeurope or us-east-1 (CLOUD)"
+    )
+    p.add_argument(
+        "--workflow-id",
+        help="advance an existing onboarding session instead of starting one",
+    )
+    p.add_argument(
+        "--step", "--step-number", dest="step", type=int, default=1, help="step number (default 1)"
+    )
+    p.add_argument(
+        "--total-steps",
+        type=int,
+        default=3,
+        help="declared wizard steps on the first call",
+    )
+    p.add_argument(
+        "--no-trigger",
+        action="store_true",
+        help="store this step without starting the installation",
+    )
+    p.add_argument(
+        "--wait", action="store_true", help="watch the installation after submitting"
+    )
+    p.add_argument(
+        "--watch",
+        metavar="WORKFLOW_ID",
+        help="only watch an onboarding that is already running",
+    )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=1800,
+        help="seconds to wait (default 1800; use 3600 for CLOUD)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the form that would be sent and exit",
+    )
+    args = p.parse_args(argv)
+
+    # --dry-run must work without any connection configured.
+    client = BudClient() if not args.dry_run else None
+
+    if args.watch:
+        return watch(BudClient(), args.watch, args.timeout)
+
+    if not args.workflow_id and not args.name:
+        p.error(
+            "--name is required when starting a new onboarding (or pass --workflow-id / --watch)"
+        )
+
+    trigger = not args.no_trigger
+    fields: dict[str, str] = {
+        "step_number": str(args.step),
+        "trigger_workflow": "true" if trigger else "false",
+        "cluster_type": args.type,
+    }
+    # Exactly one of workflow_total_steps / workflow_id - sending both, or
+    # neither, is a 400.
+    if args.workflow_id:
+        fields["workflow_id"] = args.workflow_id
+    else:
+        fields["workflow_total_steps"] = str(args.total_steps)
+    for key, value in (
+        ("name", args.name),
+        ("icon", args.icon),
+        ("ingress_url", args.ingress_url),
+        ("credential_id", args.credential_id),
+        ("provider_id", args.provider_id),
+        ("region", args.region),
+    ):
+        if value:
+            fields[key] = value
+
+    files: dict[str, pathlib.Path] = {}
+    if args.kubeconfig:
+        path = pathlib.Path(args.kubeconfig).expanduser()
+        if not path.is_file():
+            return p.error(f"kubeconfig not found: {path}") or 2
+        files["configuration_file"] = path
+
+    if args.type == "ON_PREM" and trigger and not (files or args.workflow_id):
+        p.error("ON_PREM onboarding needs --kubeconfig before it can be triggered")
+    if (
+        args.type == "CLOUD"
+        and trigger
+        and not (args.credential_id and args.provider_id and args.region)
+    ):
+        p.error(
+            "CLOUD provisioning needs --credential-id, --provider-id and --region on the triggering call"
+        )
+
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "POST": "/clusters/clusters",
+                    "form": fields,
+                    "files": {k: str(v) for k, v in files.items()},
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    body, content_type = encode_multipart(fields, files)
+    try:
+        resp = client.request(
+            "POST",
+            "/clusters/clusters",
+            raw_body=body,
+            headers={"Content-Type": content_type},
+            timeout=180,
+        )
+    except BudAPIError as exc:
+        print(f"submit failed: {exc}", file=sys.stderr)
+        return 2
+
+    workflow_id = resp.get("workflow_id")
+    print(json.dumps(resp, indent=2)[:4000])
+    if not workflow_id:
+        return 2
+    if not trigger:
+        print(
+            f"stored step {args.step}; nothing is running yet (workflow {workflow_id})",
+            file=sys.stderr,
+        )
+        return 0
+    if not args.wait:
+        print(
+            f"job id: {workflow_id}\n"
+            f"follow it with:  W={workflow_id}; bud wait job $W --timeout {args.timeout} --interval 20",
+            file=sys.stderr,
+        )
+        return 0
+    return watch(client, workflow_id, args.timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
