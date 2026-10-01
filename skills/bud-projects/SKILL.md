@@ -25,13 +25,19 @@ bud api GET /projects/ --paginate | jq -r '.[].project | "\(.id)  \(.name)"'
 bud api POST /projects/ -d '{
   "name": "HR Assistant",
   "description": "HR question answering",
-  "tags": [{"name":"hr","color":"#4F8EF7"}]
+  "tags": [{"name":"hr","color":"#4F8EF7"}],
+  "icon": "💼"
 }'
 ```
 
 The id is at `.project.id` (responses nest - see `bud-platform`).
 
 Then keep it around: `export BUD_PROJECT_ID=<id>`.
+
+**Always send an `icon`.** It is optional in the API, but a project created
+without one shows a blank tile in the console - the web console never omits it,
+so neither should you. Pick the icon with the rules in "Choosing a project
+icon" below; when in doubt, use the globe `🌐` (the console's own default).
 
 **Two project kinds exist**, and you do not choose directly - the platform
 decides from who you are:
@@ -44,6 +50,57 @@ decides from who you are:
 Administrators creating a project get `admin_app` unless they ask for
 `client_app` explicitly; non-admin users always get `client_app`. If you are
 building an app for end users to consume, say so - it needs `client_app`.
+
+## Choosing a project icon
+
+The `icon` field is a single string. The backend accepts two forms:
+
+| Form | Example | Notes |
+|---|---|---|
+| **Emoji** | `"🌐"`, `"💼"`, `"🤖"` | the normal case; what the console's picker produces |
+| **Static asset key** | `"icons/providers/openai.png"` | a path to a file that already exists under the server's static dir |
+
+Anything else - a full `https://` URL, a `data:` URI, or a root-relative
+`/images/...` path - **renders but fails validation the moment the project is
+edited**, so never store those. When unsure whether a value is an asset key that
+exists on the server, prefer an emoji.
+
+> **Gotcha:** create (`POST`) does *not* validate `icon` today, but edit
+> (`PATCH`) does - it must be an emoji on the platform's allow-list or an
+> existing static file. Choosing a valid value up front avoids a project whose
+> icon can never be changed without a 422.
+
+**Pick the icon in this order:**
+
+1. **Reuse the related entity's icon, if safe.** When the project is being
+   created for/around a specific deployed agent, model or endpoint, read that
+   entity's icon and reuse it **only if** it is an emoji or an existing static
+   asset key. An agent's `a2a_card.icon_url` and many model icons are full URLs
+   or `/public` paths - do **not** copy those; fall through to step 2 instead.
+   A model/provider asset key such as `icons/providers/openai.png` is safe.
+   (Endpoints have no icon of their own - use their model's: `endpoint.model.icon`.)
+
+2. **Infer a fitting emoji from the project's purpose** (name, tags,
+   description) from the safe set below. E.g. an HR project → `💼`, banking →
+   `🏦`, a research project → `🔬`, an agent/bot workspace → `🤖`. If nothing
+   fits, use `🌐`.
+
+3. **Ask the user when a human is in the loop.** If the runtime exposes an
+   interactive question tool (the bda-desktop agent exposes `ask_user_questions`),
+   offer a short emoji menu plus a freeform option, and set the step 1/2 choice as
+   the **recommended** default. Honor whatever they pick.
+
+4. **Otherwise default to `🌐`** - identical to the console's default, so the
+   tile is never blank.
+
+**Safe emoji set** (all on the platform allow-list, survive edit-validation):
+
+```
+🌐 🤖 🚀 💡 📊 🔬 🧠 💬 🏦 🏥 ⚙️ 📚 🛡️ ⚖️ 📝 💼 🔭 📦 🔑 ✨
+```
+
+Full rules, the agent-icon reuse check, and a concrete `ask_user_questions`
+example are in `references/icons.md`.
 
 ## Members and what they can do
 
@@ -151,6 +208,8 @@ Prefer removing members or revoking keys over deleting a shared project.
 
 ## Deeper reference
 
+- `references/icons.md` - valid icon values, the reuse-an-agent-icon rule, and
+  the human-in-the-loop picker pattern
 - `references/permissions.md` - the full scope list, how roles map to scopes,
   and how to debug a 403
 - `references/api-keys.md` - key options, budgets, rotation, and the

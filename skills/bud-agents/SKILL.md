@@ -20,6 +20,11 @@ You will use two planes:
 Prerequisite: connect first - see `bud-platform` (`bud login`). You also need a
 `project_id` (`bud-projects`) and a **running deployment that serves Responses**.
 
+> If you **create a new project** to house this agent, give that project a
+> fitting `icon` - and reuse the agent's own icon when it is safe to (an emoji or
+> an existing static asset key, not a URL). See the `bud-projects` skill's
+> project-icon reference for the rules.
+
 > **Chat support is not enough, and this is the trap that wastes the most time.**
 > Agents run on `/v1/responses`, not `/v1/chat/completions`. Most deployments do
 > not serve it: on the reference installation **28 of 29 deployments have chat
