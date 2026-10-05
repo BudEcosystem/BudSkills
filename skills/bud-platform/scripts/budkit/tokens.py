@@ -49,15 +49,24 @@ _UNKNOWN_TTL_SECONDS = 300
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) BudFoundrySkill/1.0"
 
 
-def _decode_jwt_exp(token: str) -> float | None:
-    """Return a JWT's ``exp`` (epoch seconds) without verifying the signature."""
+def decode_jwt_claims(token: str) -> dict | None:
+    """Return a JWT's payload claims without verifying the signature, or None."""
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)  # pad to a multiple of 4
         data = json.loads(base64.urlsafe_b64decode(payload))
-        exp = data.get("exp")
-        return float(exp) if exp is not None else None
+        return data if isinstance(data, dict) else None
     except Exception:
+        return None
+
+
+def _decode_jwt_exp(token: str) -> float | None:
+    """Return a JWT's ``exp`` (epoch seconds) without verifying the signature."""
+    claims = decode_jwt_claims(token)
+    exp = claims.get("exp") if claims else None
+    try:
+        return float(exp) if exp is not None else None
+    except (TypeError, ValueError):
         return None
 
 
@@ -113,6 +122,13 @@ def _tokens_from_mapping(data: dict[str, Any], source: str) -> _Candidate | None
     access = data.get("accessToken") or data.get("access_token") or data.get("token")
     if isinstance(access, dict):  # some envelopes nest the token set under "token"
         return _tokens_from_mapping(access, source)
+    if access is None:
+        # The desktop app's auth.json wraps the token set under a "session" key
+        # (tauri-plugin-store); other envelopes use "data". Unwrap and recurse.
+        for wrapper in ("session", "data"):
+            inner = data.get(wrapper)
+            if isinstance(inner, dict):
+                return _tokens_from_mapping(inner, source)
     if not isinstance(access, str) or not access:
         return None
     refresh = data.get("refreshToken") or data.get("refresh_token")
@@ -196,6 +212,13 @@ class TokenProvider:
     def available(self) -> bool:
         """True if any bearer source is present."""
         return self._best() is not None
+
+    def is_expired(self) -> bool:
+        """True when the freshest bearer token is present but past its lifetime.
+        Lets the client prefer a fresh cookie session (from `bud login`) over a
+        dead desktop token."""
+        best = self._best()
+        return best is not None and not best.is_fresh()
 
     def source(self) -> str | None:
         return self._current.source if self._current else (self._best().source if self._best() else None)

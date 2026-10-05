@@ -23,7 +23,23 @@ from typing import Any
 
 from .client import BudClient, extract_list, unwrap
 from .config import Config, save_config
-from .errors import BudError
+from .errors import BudAPIError, BudAuthError, BudError
+
+# When the session is dead and cannot be refreshed, exit with this distinct code
+# and print the sentinel below. A host that runs `bud` (e.g. the Bud Studio
+# desktop agent) can detect either and surface an interactive login affordance
+# instead of treating it as a generic failure. See references/authentication.md.
+AUTH_REQUIRED_EXIT = 77
+AUTH_REQUIRED_SENTINEL = "__BUD_AUTH_REQUIRED__"
+
+
+def _is_auth_required(exc: BudError) -> bool:
+    """True when a failure means 'the user must sign in again', not a bad request."""
+    if isinstance(exc, BudAuthError):
+        return True
+    if isinstance(exc, BudAPIError) and exc.status == 401:
+        return True
+    return False
 from .waits import (
     fetch_job,
     present,
@@ -124,21 +140,27 @@ def cmd_login(args: argparse.Namespace) -> int:
         profile=args.profile,
     )
     cfg.require("api_url")
-
-    # Bearer path: OIDC-only installs have no password login. If a token source
-    # is present (env, token file, or the desktop app's auth.json), validate it
-    # instead of asking for a password.
     client = BudClient(cfg)
+
+    # Already signed in? Reuse an existing session (a usable bearer token or a
+    # cached cookie session) instead of logging in again. `--force` skips this.
+    if not args.force and client.has_valid_session():
+        _err(f"Already signed in to {cfg.api_url}.")
+        _out(unwrap(client.get("/users/me"), "user"))
+        return 0
+
+    # Bearer path: if a token source is present (env, token file, or the desktop
+    # app's auth.json), validate it instead of asking for a password.
     if client.tokens.available():
-        me = client.get("/users/me")
+        me = client.get("/users/me")  # raises auth-required (exit 77) if dead
         save_config({"api_url": cfg.api_url, "ui_url": cfg.ui_url})
         _err(f"Signed in to {cfg.api_url} with a bearer token (source: {client.tokens.source()}).")
         _out(unwrap(me, "user"))
         return 0
 
     if not cfg.email:
-        raise SystemExit(
-            "bud: no credentials. Set BUD_ACCESS_TOKEN (or sign in via the Bud Studio "
+        raise BudAuthError(
+            "No Bud Foundry session. Set BUD_ACCESS_TOKEN (or sign in via the Bud Studio "
             "desktop app so it writes auth.json) for OIDC-only installs, or pass --email / "
             "set BUD_EMAIL for password sign-in."
         )
@@ -523,6 +545,14 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except BudError as exc:
         _err(f"bud: {exc}")
+        if _is_auth_required(exc):
+            _err(
+                f"{AUTH_REQUIRED_SENTINEL} The Bud Foundry session has expired and could not be "
+                "refreshed. Re-establish it with `bud login` (set BUD_EMAIL and BUD_PASSWORD in the "
+                "environment first), then retry this command. If credentials are not configured, ask "
+                "the user to set them."
+            )
+            return AUTH_REQUIRED_EXIT
         return 1
     except KeyboardInterrupt:
         _err("bud: interrupted")

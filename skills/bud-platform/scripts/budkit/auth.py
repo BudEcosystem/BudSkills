@@ -151,7 +151,13 @@ class Session:
                 "unexpected screen (SSO-only, consent, or an outage).\n"
                 f"Landed on: {landed}"
             )
-        action = _unescape_action(match.group(1))
+        # Resolve relative to the page we landed on. Modern sign-in pages render
+        # as a single-page app: the server ships only a shell plus a
+        # ``window.kcContext = {...}`` script, so there is no server-rendered
+        # ``<form>`` -- we read ``loginAction`` out of that embedded context
+        # instead, and it is a **relative** path. ``urljoin`` turns it into the
+        # absolute URL the POST needs; an already-absolute action is unchanged.
+        action = urllib.parse.urljoin(landed, _unescape_action(match.group(1)))
 
         # Step 3: submit the credentials.
         form = urllib.parse.urlencode({"username": email, "password": password, "credentialId": ""}).encode()

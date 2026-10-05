@@ -76,6 +76,39 @@ it.**
 > A bearer token obtained this way does not need a CSRF header - that is a
 > cookie-session construct - so mutating calls work the same way.
 
+### When the session dies mid-task
+
+If the token is revoked or its refresh token expires while you are working, the
+toolkit cannot refresh on its own - re-run `bud login`. To make this unambiguous
+for a host that runs `bud` for you, **any** command that fails for an auth reason
+(a 401, or a refresh that cannot complete) does two things:
+
+- exits with the distinct code **`77`** (ordinary failures exit `1`), and
+- prints the sentinel **`__BUD_AUTH_REQUIRED__`** on stderr.
+
+When you see that (sentinel or exit `77`), re-establish the session and retry:
+
+```bash
+bud login          # uses BUD_EMAIL + BUD_PASSWORD from the environment
+# then re-run the command that failed; the toolkit reuses the fresh session
+```
+
+`bud login` is **safe to call anytime**: it first checks for an existing valid
+session - a usable bearer token (including the desktop app's `auth.json`, fresh or
+refreshable) or a cached cookie session - and reports "Already signed in" without
+re-authenticating. It only attempts a new sign-in when there is no valid session
+(use `--force` to re-authenticate regardless).
+
+When it does sign in, `bud login` drives the sign-in page headlessly - it reads the
+form target out of the page's embedded context, so it works even on single-page
+sign-in themes that render the form client-side, with no browser. It does need credentials:
+`BUD_EMAIL` and `BUD_PASSWORD` must be in the environment for a non-interactive
+retry. If they are not set, **ask the user to set them** (or to sign in) rather
+than guessing - repeated wrong passwords can lock the account.
+
+A fresh `bud login` session takes precedence over a stale bearer token, so once
+you have re-logged in the next command uses the new session automatically.
+
 What Option A does: starts the flow at `/auth/redirect/authorize`, follows the
 redirect to the identity provider, submits the credentials to the form target
 embedded in its sign-in page, and follows the callback back to Bud, which mints

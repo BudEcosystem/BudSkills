@@ -70,6 +70,11 @@ Consequences worth knowing:
 - If `bud login` reports it landed on an unexpected screen or found no form, the
   install is OIDC-only or needs MFA/consent: switch to the bearer token above.
   Do not try to defeat the browser flow.
+- **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
+  session is dead. Re-run **`bud login`** (it uses `BUD_EMAIL`/`BUD_PASSWORD` from
+  the environment and works headlessly against single-page sign-in themes), then
+  re-run the command. If credentials aren't set, ask the user to set them. See
+  `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,
 service accounts and non-interactive/CI setups.
