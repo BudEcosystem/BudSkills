@@ -206,18 +206,12 @@ class TokenProvider:
         """True if any bearer source is present."""
         return self._best() is not None
 
-    def any_access_token(self) -> str | None:
-        """The freshest access token we can see, even if expired - used only to
-        read non-secret claims like the issuer for a device-flow login."""
+    def is_expired(self) -> bool:
+        """True when the freshest bearer token is present but past its lifetime.
+        Lets the client prefer a fresh cookie session (from `bud login`) over a
+        dead desktop token."""
         best = self._best()
-        return best.access if best else None
-
-    def store_token_set(self, data: dict) -> None:
-        """Persist a token set obtained out-of-band (e.g. a device-grant login)
-        to the profile cache so subsequent calls authenticate with it."""
-        cand = _tokens_from_mapping(data, "cache")
-        if cand is not None:
-            self._persist(cand)
+        return best is not None and not best.is_fresh()
 
     def source(self) -> str | None:
         return self._current.source if self._current else (self._best().source if self._best() else None)

@@ -141,16 +141,8 @@ def cmd_login(args: argparse.Namespace) -> int:
     )
     cfg.require("api_url")
 
-    # Device-authorization path: the right way to sign in on an OIDC-only
-    # install from a headless CLI. Two steps so a chat agent can show the code:
-    #   bud login --device          -> prints the verification URL + user code
-    #   bud login --device --wait   -> polls until the user approves, caches token
-    if getattr(args, "device", False):
-        return _device_login(args, cfg)
-
-    # Bearer path: OIDC-only installs have no password login. If a token source
-    # is present (env, token file, or the desktop app's auth.json), validate it
-    # instead of asking for a password.
+    # Bearer path: if a token source is present (env, token file, or the desktop
+    # app's auth.json), validate it instead of asking for a password.
     client = BudClient(cfg)
     if client.tokens.available():
         me = client.get("/users/me")
@@ -180,46 +172,6 @@ def cmd_login(args: argparse.Namespace) -> int:
     return 0
 
 
-def _device_login(args: argparse.Namespace, cfg: Config) -> int:
-    """OIDC device-authorization login (RFC 8628). See budkit/device.py."""
-    from . import device
-    from .tokens import TokenProvider
-
-    tokens = TokenProvider(cfg)
-
-    if getattr(args, "wait", False):
-        handle = device.load_handle(cfg)
-        if not handle:
-            raise BudAuthError("No pending device sign-in. Run `bud login --device` first.")
-        token_set = device.wait(handle)
-        tokens.store_token_set(token_set)
-        device.clear_handle(cfg)
-        save_config({"api_url": cfg.api_url, "ui_url": cfg.ui_url})
-        _err("Signed in via device authorization.")
-        _out(unwrap(BudClient(cfg).get("/users/me"), "user"))
-        return 0
-
-    # Start: ask the IdP for a code and print it for the user (and for an agent
-    # to render). `--wait` finishes the flow once they have approved.
-    issuer = device.resolve_issuer(cfg, tokens.any_access_token())
-    client_id = device.resolve_client_id(cfg)
-    handle = device.start(issuer, client_id)
-    device.save_handle(cfg, handle)
-    _out(
-        {
-            "verification_uri": handle["verification_uri"],
-            "verification_uri_complete": handle["verification_uri_complete"],
-            "user_code": handle["user_code"],
-            "expires_in": handle["expires_in"],
-        }
-    )
-    _err(
-        f"To sign in, open {handle['verification_uri_complete']} and approve "
-        f"(code: {handle['user_code']}), then run: bud login --device --wait"
-    )
-    return 0
-
-
 def cmd_whoami(args: argparse.Namespace) -> int:
     client = _client(args)
     _out(unwrap(client.get("/users/me"), "user"))
@@ -227,12 +179,9 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
-    from . import device
-
     client = _client(args)
     client.session.clear()
     client.tokens.clear()
-    device.clear_handle(client.config)
     _err("Signed out (local session and cached token discarded).")
     return 0
 
@@ -513,16 +462,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--email")
     s.add_argument("--password", help="prefer the BUD_PASSWORD env var")
     s.add_argument("--force", action="store_true", help="ignore any cached session")
-    s.add_argument(
-        "--device",
-        action="store_true",
-        help="OIDC device-authorization sign-in (for OIDC-only installs)",
-    )
-    s.add_argument(
-        "--wait",
-        action="store_true",
-        help="with --device: poll until the user approves, then cache the token",
-    )
     s.set_defaults(func=cmd_login)
 
     sub.add_parser("whoami", help="show the signed-in user").set_defaults(func=cmd_whoami)
@@ -602,10 +541,9 @@ def main(argv: list[str] | None = None) -> int:
         if _is_auth_required(exc):
             _err(
                 f"{AUTH_REQUIRED_SENTINEL} The Bud Foundry session has expired and could not be "
-                "refreshed. Start an OIDC device sign-in with `bud login --device` (it prints a URL "
-                "and a short code); in the Bud Studio desktop app, render a 'sign in' card with the "
-                "create_artifact tool showing that URL/code, then run `bud login --device --wait` and "
-                "retry this command once the user approves."
+                "refreshed. Re-establish it with `bud login` (set BUD_EMAIL and BUD_PASSWORD in the "
+                "environment first), then retry this command. If credentials are not configured, ask "
+                "the user to set them."
             )
             return AUTH_REQUIRED_EXIT
         return 1

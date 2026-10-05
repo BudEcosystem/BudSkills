@@ -76,54 +76,32 @@ it.**
 > A bearer token obtained this way does not need a CSRF header - that is a
 > cookie-session construct - so mutating calls work the same way.
 
-### When the session dies mid-task - device sign-in
+### When the session dies mid-task
 
 If the token is revoked or its refresh token expires while you are working, the
-toolkit cannot refresh on its own. On an OIDC-only install there is no password to
-submit, so re-auth uses the **OIDC device authorization grant** - the toolkit
-drives it; you only surface the code. **Any** command that fails for an auth
-reason (a 401, or a refresh that cannot complete) does two things:
+toolkit cannot refresh on its own - re-run `bud login`. To make this unambiguous
+for a host that runs `bud` for you, **any** command that fails for an auth reason
+(a 401, or a refresh that cannot complete) does two things:
 
 - exits with the distinct code **`77`** (ordinary failures exit `1`), and
 - prints the sentinel **`__BUD_AUTH_REQUIRED__`** on stderr.
 
-When you see that (sentinel or exit `77`), run the device flow and show the user
-the code with a generic artifact - do **not** collect a password, and do not
-expect a dedicated login tool (the UI is a normal artifact):
+When you see that (sentinel or exit `77`), re-establish the session and retry:
 
 ```bash
-# 1. Start device sign-in. Prints JSON with the verification URL and user code.
-bud login --device
-#   -> {"verification_uri_complete":"https://auth.<domain>/realms/<realm>/device?user_code=WXYZ-1234",
-#       "verification_uri":"https://auth.<domain>/realms/<realm>/device",
-#       "user_code":"WXYZ-1234","expires_in":600}
+bud login          # uses BUD_EMAIL + BUD_PASSWORD from the environment
+# then re-run the command that failed; the toolkit reuses the fresh session
 ```
 
-2. **Render a generic `create_artifact` card** showing the code and a **"Sign in"**
-   button that opens `verification_uri_complete` (it's an `https://` URL, so an
-   `@OpenUrl` button works with the stock components - no custom tool). A suitable
-   intent:
+`bud login` drives the sign-in page headlessly - it reads the form target out of
+the page's embedded context, so it works even on single-page sign-in themes that
+render the form client-side, with no browser. It does need credentials:
+`BUD_EMAIL` and `BUD_PASSWORD` must be in the environment for a non-interactive
+retry. If they are not set, **ask the user to set them** (or to sign in) rather
+than guessing - repeated wrong passwords can lock the account.
 
-   > "A small 'Sign in to Bud' card. Body: 'Your session expired. Click Sign in
-   > (or go to &lt;verification_uri&gt; and enter code &lt;user_code&gt;) to continue.' A
-   > primary button labelled 'Sign in' that opens the URL
-   > &lt;verification_uri_complete&gt;."
-
-```bash
-# 3. Block until the user approves in their browser, then cache the token.
-bud login --device --wait
-# 4. Re-run the command that originally failed — it now reads the fresh token.
-```
-
-On installs that still allow it you can fall back to `bud login` (password /
-bearer). Outside a UI (plain Claude Code / CI), just run `bud login --device`,
-show the user the printed URL + code, then `bud login --device --wait`.
-
-> Requires the identity provider to expose a **`bud-cli`** public client with the
-> device grant enabled (an infra/realm config change). Set `BUD_OIDC_ISSUER` if the
-> issuer can't be derived from an existing token, and `BUD_OIDC_CLIENT_ID` to
-> override the default `bud-cli`. Never put a password field in any artifact -
-> values submitted from an artifact are persisted into the transcript.
+A fresh `bud login` session takes precedence over a stale bearer token, so once
+you have re-logged in the next command uses the new session automatically.
 
 What Option A does: starts the flow at `/auth/redirect/authorize`, follows the
 redirect to the identity provider, submits the credentials to the form target

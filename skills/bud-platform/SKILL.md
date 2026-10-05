@@ -71,10 +71,9 @@ Consequences worth knowing:
   install is OIDC-only or needs MFA/consent: switch to the bearer token above.
   Do not try to defeat the browser flow.
 - **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
-  session is dead. Re-auth with the OIDC **device flow**: run `bud login --device`
-  (prints a verification URL + code), show them with a generic **`create_artifact`**
-  card whose "Sign in" button opens that https URL, then `bud login --device --wait`
-  and re-run the command. No password, no custom tool. See
+  session is dead. Re-run **`bud login`** (it uses `BUD_EMAIL`/`BUD_PASSWORD` from
+  the environment and works headlessly against single-page sign-in themes), then
+  re-run the command. If credentials aren't set, ask the user to set them. See
   `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,
