@@ -87,31 +87,30 @@ auth reason (a 401, or a refresh that cannot complete) does two things:
 - prints the sentinel **`__BUD_AUTH_REQUIRED__`** on stderr.
 
 **In the Bud Studio desktop app, when you see that sentinel (or exit `77`),
-render a sign-in prompt with the generic `create_artifact` tool** - do not just
-tell the user to "click login" in prose, and do not expect a dedicated login
-tool (there is none; the UI is a normal artifact). Pass `create_artifact` an
-intent describing a small card with two buttons:
+render a "session expired" prompt with the generic `create_artifact` tool** - do
+not just tell the user to "click login" in prose, and do not expect a dedicated
+login tool (there is none; the UI is a normal artifact built from the existing
+components). Pass `create_artifact` an intent describing a small card:
 
-- a **"Sign in"** button that opens the URL **`budstudio://host/reauthenticate`**
-  (the desktop recognises this internal URL and runs its own login flow - it does
-  **not** open a browser), and
+- a short body telling the user their Bud Foundry session has expired and to
+  **sign in again** (the desktop surfaces its own login when the session drops -
+  the sign-in itself is the app's job, not this card's), and
 - a **"Retry"** button that sends a short message back to you (e.g. "I've signed
   in, please retry") so the turn continues.
 
 A suitable intent string:
 
 > "A small 'Session expired' card. Body: 'Your Bud Foundry session has expired.
-> Sign in to continue.' A primary button labelled 'Sign in' that opens the URL
-> `budstudio://host/reauthenticate`. A secondary button labelled 'I've signed in
-> — retry' that sends the message 'I have signed in, please retry.'"
+> Sign in again in the app, then click Retry.' A button labelled 'Retry' that
+> sends the message 'I have signed in, please retry.'"
 
-When the user clicks **Sign in**, the desktop drops the dead session and runs its
-own login, which rewrites `auth.json`. When they then click **Retry**, you get a
-new turn - **re-run the command that failed**; the toolkit reads the fresh token
-from `auth.json` automatically. Never collect the password in the form: on
-OIDC-only installs there is nothing to collect, and a form value would be
-persisted into the transcript. The sign-in always goes through the host's own
-flow, never through this UI.
+When the user has signed in (through the app's own login, which rewrites
+`auth.json`) and clicks **Retry**, you get a new turn - **re-run the command that
+failed**; the toolkit reads the fresh token from `auth.json` automatically.
+
+Never put a password field in the card. On OIDC-only installs there is nothing to
+collect, and an artifact form value is persisted into the transcript - so the
+sign-in must always go through the app's own login, never through this UI.
 
 Outside that app (plain Claude Code / CI), there is no `create_artifact` surface
 - treat the sentinel as "stop and ask the user to run `bud login` / provide a

@@ -72,9 +72,9 @@ Consequences worth knowing:
   Do not try to defeat the browser flow.
 - **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
   session is dead and cannot be refreshed. In the Bud Studio desktop app, render
-  a sign-in prompt with the generic **`create_artifact`** tool - a card with a
-  **Sign in** button opening `budstudio://host/reauthenticate` and a **Retry**
-  button - then re-run the command once the user signs in. See
+  a "session expired" prompt with the generic **`create_artifact`** tool - a card
+  telling the user to sign in again (the app surfaces its own login) plus a
+  **Retry** button - then re-run the command once they retry. See
   `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,

@@ -542,8 +542,10 @@ def main(argv: list[str] | None = None) -> int:
         if _is_auth_required(exc):
             _err(
                 f"{AUTH_REQUIRED_SENTINEL} The Bud Foundry session has expired and could not be "
-                "refreshed. Call the request_login tool to show the user an inline login button; "
-                "once they have signed in, retry this command."
+                "refreshed. In the Bud Studio desktop app, render a 'session expired' prompt with "
+                "the create_artifact tool (a card telling the user to sign in again, plus a Retry "
+                "button); once they have signed in, retry this command. Elsewhere, ask the user to "
+                "run `bud login` or provide a fresh BUD_ACCESS_TOKEN."
             )
             return AUTH_REQUIRED_EXIT
         return 1
