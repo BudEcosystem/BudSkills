@@ -23,7 +23,23 @@ from typing import Any
 
 from .client import BudClient, extract_list, unwrap
 from .config import Config, save_config
-from .errors import BudError
+from .errors import BudAPIError, BudAuthError, BudError
+
+# When the session is dead and cannot be refreshed, exit with this distinct code
+# and print the sentinel below. A host that runs `bud` (e.g. the Bud Studio
+# desktop agent) can detect either and surface an interactive login affordance
+# instead of treating it as a generic failure. See references/authentication.md.
+AUTH_REQUIRED_EXIT = 77
+AUTH_REQUIRED_SENTINEL = "__BUD_AUTH_REQUIRED__"
+
+
+def _is_auth_required(exc: BudError) -> bool:
+    """True when a failure means 'the user must sign in again', not a bad request."""
+    if isinstance(exc, BudAuthError):
+        return True
+    if isinstance(exc, BudAPIError) and exc.status == 401:
+        return True
+    return False
 from .waits import (
     fetch_job,
     present,
@@ -137,8 +153,8 @@ def cmd_login(args: argparse.Namespace) -> int:
         return 0
 
     if not cfg.email:
-        raise SystemExit(
-            "bud: no credentials. Set BUD_ACCESS_TOKEN (or sign in via the Bud Studio "
+        raise BudAuthError(
+            "No Bud Foundry session. Set BUD_ACCESS_TOKEN (or sign in via the Bud Studio "
             "desktop app so it writes auth.json) for OIDC-only installs, or pass --email / "
             "set BUD_EMAIL for password sign-in."
         )
@@ -523,6 +539,13 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except BudError as exc:
         _err(f"bud: {exc}")
+        if _is_auth_required(exc):
+            _err(
+                f"{AUTH_REQUIRED_SENTINEL} The Bud Foundry session has expired and could not be "
+                "refreshed. Call the request_login tool to show the user an inline login button; "
+                "once they have signed in, retry this command."
+            )
+            return AUTH_REQUIRED_EXIT
         return 1
     except KeyboardInterrupt:
         _err("bud: interrupted")
