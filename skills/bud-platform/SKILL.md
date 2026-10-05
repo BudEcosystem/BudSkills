@@ -71,9 +71,11 @@ Consequences worth knowing:
   install is OIDC-only or needs MFA/consent: switch to the bearer token above.
   Do not try to defeat the browser flow.
 - **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
-  session is dead and cannot be refreshed. In the Bud Studio desktop app, call
-  the **`request_login`** tool (it shows an inline login button and pauses until
-  the user signs in), then retry. See `references/authentication.md`.
+  session is dead and cannot be refreshed. In the Bud Studio desktop app, render
+  a sign-in prompt with the generic **`create_artifact`** tool - a card with a
+  **Sign in** button opening `budstudio://host/reauthenticate` and a **Retry**
+  button - then re-run the command once the user signs in. See
+  `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,
 service accounts and non-interactive/CI setups.
