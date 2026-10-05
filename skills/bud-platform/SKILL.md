@@ -71,10 +71,10 @@ Consequences worth knowing:
   install is OIDC-only or needs MFA/consent: switch to the bearer token above.
   Do not try to defeat the browser flow.
 - **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
-  session is dead and cannot be refreshed. In the Bud Studio desktop app, render
-  a "session expired" prompt with the generic **`create_artifact`** tool - a card
-  telling the user to sign in again (the app surfaces its own login) plus a
-  **Retry** button - then re-run the command once they retry. See
+  session is dead. Re-auth with the OIDC **device flow**: run `bud login --device`
+  (prints a verification URL + code), show them with a generic **`create_artifact`**
+  card whose "Sign in" button opens that https URL, then `bud login --device --wait`
+  and re-run the command. No password, no custom tool. See
   `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,

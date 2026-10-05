@@ -49,15 +49,24 @@ _UNKNOWN_TTL_SECONDS = 300
 _USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) BudFoundrySkill/1.0"
 
 
-def _decode_jwt_exp(token: str) -> float | None:
-    """Return a JWT's ``exp`` (epoch seconds) without verifying the signature."""
+def decode_jwt_claims(token: str) -> dict | None:
+    """Return a JWT's payload claims without verifying the signature, or None."""
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)  # pad to a multiple of 4
         data = json.loads(base64.urlsafe_b64decode(payload))
-        exp = data.get("exp")
-        return float(exp) if exp is not None else None
+        return data if isinstance(data, dict) else None
     except Exception:
+        return None
+
+
+def _decode_jwt_exp(token: str) -> float | None:
+    """Return a JWT's ``exp`` (epoch seconds) without verifying the signature."""
+    claims = decode_jwt_claims(token)
+    exp = claims.get("exp") if claims else None
+    try:
+        return float(exp) if exp is not None else None
+    except (TypeError, ValueError):
         return None
 
 
@@ -196,6 +205,19 @@ class TokenProvider:
     def available(self) -> bool:
         """True if any bearer source is present."""
         return self._best() is not None
+
+    def any_access_token(self) -> str | None:
+        """The freshest access token we can see, even if expired - used only to
+        read non-secret claims like the issuer for a device-flow login."""
+        best = self._best()
+        return best.access if best else None
+
+    def store_token_set(self, data: dict) -> None:
+        """Persist a token set obtained out-of-band (e.g. a device-grant login)
+        to the profile cache so subsequent calls authenticate with it."""
+        cand = _tokens_from_mapping(data, "cache")
+        if cand is not None:
+            self._persist(cand)
 
     def source(self) -> str | None:
         return self._current.source if self._current else (self._best().source if self._best() else None)

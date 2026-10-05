@@ -76,45 +76,54 @@ it.**
 > A bearer token obtained this way does not need a CSRF header - that is a
 > cookie-session construct - so mutating calls work the same way.
 
-### When the session dies mid-task (desktop app)
+### When the session dies mid-task - device sign-in
 
 If the token is revoked or its refresh token expires while you are working, the
-toolkit cannot recover on its own - the user has to sign in again. To make this
-unambiguous for a host that runs `bud` for you, **any** command that fails for an
-auth reason (a 401, or a refresh that cannot complete) does two things:
+toolkit cannot refresh on its own. On an OIDC-only install there is no password to
+submit, so re-auth uses the **OIDC device authorization grant** - the toolkit
+drives it; you only surface the code. **Any** command that fails for an auth
+reason (a 401, or a refresh that cannot complete) does two things:
 
 - exits with the distinct code **`77`** (ordinary failures exit `1`), and
 - prints the sentinel **`__BUD_AUTH_REQUIRED__`** on stderr.
 
-**In the Bud Studio desktop app, when you see that sentinel (or exit `77`),
-render a "session expired" prompt with the generic `create_artifact` tool** - do
-not just tell the user to "click login" in prose, and do not expect a dedicated
-login tool (there is none; the UI is a normal artifact built from the existing
-components). Pass `create_artifact` an intent describing a small card:
+When you see that (sentinel or exit `77`), run the device flow and show the user
+the code with a generic artifact - do **not** collect a password, and do not
+expect a dedicated login tool (the UI is a normal artifact):
 
-- a short body telling the user their Bud Foundry session has expired and to
-  **sign in again** (the desktop surfaces its own login when the session drops -
-  the sign-in itself is the app's job, not this card's), and
-- a **"Retry"** button that sends a short message back to you (e.g. "I've signed
-  in, please retry") so the turn continues.
+```bash
+# 1. Start device sign-in. Prints JSON with the verification URL and user code.
+bud login --device
+#   -> {"verification_uri_complete":"https://auth.<domain>/realms/<realm>/device?user_code=WXYZ-1234",
+#       "verification_uri":"https://auth.<domain>/realms/<realm>/device",
+#       "user_code":"WXYZ-1234","expires_in":600}
+```
 
-A suitable intent string:
+2. **Render a generic `create_artifact` card** showing the code and a **"Sign in"**
+   button that opens `verification_uri_complete` (it's an `https://` URL, so an
+   `@OpenUrl` button works with the stock components - no custom tool). A suitable
+   intent:
 
-> "A small 'Session expired' card. Body: 'Your Bud Foundry session has expired.
-> Sign in again in the app, then click Retry.' A button labelled 'Retry' that
-> sends the message 'I have signed in, please retry.'"
+   > "A small 'Sign in to Bud' card. Body: 'Your session expired. Click Sign in
+   > (or go to &lt;verification_uri&gt; and enter code &lt;user_code&gt;) to continue.' A
+   > primary button labelled 'Sign in' that opens the URL
+   > &lt;verification_uri_complete&gt;."
 
-When the user has signed in (through the app's own login, which rewrites
-`auth.json`) and clicks **Retry**, you get a new turn - **re-run the command that
-failed**; the toolkit reads the fresh token from `auth.json` automatically.
+```bash
+# 3. Block until the user approves in their browser, then cache the token.
+bud login --device --wait
+# 4. Re-run the command that originally failed — it now reads the fresh token.
+```
 
-Never put a password field in the card. On OIDC-only installs there is nothing to
-collect, and an artifact form value is persisted into the transcript - so the
-sign-in must always go through the app's own login, never through this UI.
+On installs that still allow it you can fall back to `bud login` (password /
+bearer). Outside a UI (plain Claude Code / CI), just run `bud login --device`,
+show the user the printed URL + code, then `bud login --device --wait`.
 
-Outside that app (plain Claude Code / CI), there is no `create_artifact` surface
-- treat the sentinel as "stop and ask the user to run `bud login` / provide a
-fresh `BUD_ACCESS_TOKEN`."
+> Requires the identity provider to expose a **`bud-cli`** public client with the
+> device grant enabled (an infra/realm config change). Set `BUD_OIDC_ISSUER` if the
+> issuer can't be derived from an existing token, and `BUD_OIDC_CLIENT_ID` to
+> override the default `bud-cli`. Never put a password field in any artifact -
+> values submitted from an artifact are persisted into the transcript.
 
 What Option A does: starts the flow at `/auth/redirect/authorize`, follows the
 redirect to the identity provider, submits the credentials to the form target

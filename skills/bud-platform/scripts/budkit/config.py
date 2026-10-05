@@ -34,6 +34,8 @@ _ENV = {
     "access_token": "BUD_ACCESS_TOKEN",
     "refresh_token": "BUD_REFRESH_TOKEN",
     "token_file": "BUD_TOKEN_FILE",
+    "oidc_issuer": "BUD_OIDC_ISSUER",
+    "oidc_client_id": "BUD_OIDC_CLIENT_ID",
 }
 
 _DEFAULTS: dict[str, Any] = {
@@ -48,6 +50,8 @@ _DEFAULTS: dict[str, Any] = {
     "access_token": None,
     "refresh_token": None,
     "token_file": None,
+    "oidc_issuer": None,
+    "oidc_client_id": None,
 }
 
 # Settings never written to the config file - secrets, or values that belong to
