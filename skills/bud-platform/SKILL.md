@@ -48,18 +48,33 @@ reuse it, renewing automatically when it expires. Confirm with `bud whoami`.
 If `bud` is not on your PATH, run `bash scripts/setup.sh` once, or call it by
 its path: `<skill-dir>/scripts/bud`.
 
-**Bud sign-in is browser-style single sign-on** - there is no password API
-endpoint. The toolkit completes the redirect handshake over plain HTTP for you.
+**Bud sign-in is browser-style single sign-on** (OpenID Connect). There are two
+ways in and the toolkit picks whichever fits the installation:
+
+- **Password** (above): works where the identity provider still shows a password
+  form; the toolkit drives the redirect handshake over plain HTTP for you.
+- **Bearer token** (OIDC-only installations): many installations **disable
+  password login** - `bud login` then reports it found no sign-in form. In that
+  case reuse a token minted by a real browser login: have the user sign in
+  through the **Bud Studio desktop app** (it writes `auth.json`, which the
+  toolkit finds automatically), or `export BUD_ACCESS_TOKEN=<jwt>`. The toolkit
+  then authenticates with the token and refreshes it on its own.
+
 Consequences worth knowing:
 
-- Mutating calls need a CSRF header. The toolkit adds it; hand-rolled `curl`
-  will get 403.
+- Mutating calls need a CSRF header in password mode. The toolkit adds it;
+  hand-rolled `curl` will get 403. (Bearer mode needs no CSRF.)
 - Wrong passwords are reported by the identity provider, and **repeated
   failures can lock the account**. If sign-in fails, stop and confirm the
   credential - do not retry variations.
-- Some installations use a corporate identity provider that requires a real
-  browser. If `bud login` reports it landed on an unexpected screen, ask the
-  user to sign in via the console and say so; do not try to work around it.
+- If `bud login` reports it landed on an unexpected screen or found no form, the
+  install is OIDC-only or needs MFA/consent: switch to the bearer token above.
+  Do not try to defeat the browser flow.
+- **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
+  session is dead. Re-run **`bud login`** (it uses `BUD_EMAIL`/`BUD_PASSWORD` from
+  the environment and works headlessly against single-page sign-in themes), then
+  re-run the command. If credentials aren't set, ask the user to set them. See
+  `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,
 service accounts and non-interactive/CI setups.

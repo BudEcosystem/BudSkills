@@ -31,6 +31,9 @@ _ENV = {
     "project_id": "BUD_PROJECT_ID",
     "inference_url": "BUD_INFERENCE_URL",
     "api_key": "BUD_API_KEY",
+    "access_token": "BUD_ACCESS_TOKEN",
+    "refresh_token": "BUD_REFRESH_TOKEN",
+    "token_file": "BUD_TOKEN_FILE",
 }
 
 _DEFAULTS: dict[str, Any] = {
@@ -42,7 +45,14 @@ _DEFAULTS: dict[str, Any] = {
     "project_id": None,
     "inference_url": None,
     "api_key": None,
+    "access_token": None,
+    "refresh_token": None,
+    "token_file": None,
 }
+
+# Settings never written to the config file - secrets, or values that belong to
+# the environment of a single run.
+_SECRET_KEYS = ("password", "api_key", "access_token", "refresh_token")
 
 
 def _read_file() -> dict[str, Any]:
@@ -96,7 +106,7 @@ class Config:
     def as_dict(self, redact: bool = True) -> dict[str, Any]:
         out = dict(self._values)
         if redact:
-            for key in ("password", "api_key"):
+            for key in _SECRET_KEYS:
                 if out.get(key):
                     out[key] = "***redacted***"
         return out
@@ -104,6 +114,10 @@ class Config:
     @property
     def session_path(self) -> Path:
         return DEFAULT_CONFIG_DIR / f"session-{self._values['profile']}.txt"
+
+    @property
+    def token_state_path(self) -> Path:
+        return DEFAULT_CONFIG_DIR / f"token-{self._values['profile']}.json"
 
     @property
     def state_path(self) -> Path:
@@ -138,7 +152,7 @@ def save_config(values: dict[str, Any]) -> Path:
     """Persist non-secret configuration to disk (0600)."""
     DEFAULT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     existing = _read_file()
-    existing.update({k: v for k, v in values.items() if k not in ("password", "api_key")})
+    existing.update({k: v for k, v in values.items() if k not in _SECRET_KEYS})
     tmp = CONFIG_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(existing, fh, indent=2, sort_keys=True)
