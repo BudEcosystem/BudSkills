@@ -20,11 +20,16 @@ unsuitable for automation - see "Project API keys" below. Prefer `bud token`.
 ## Signing in
 
 Bud uses browser-style single sign-on (OpenID Connect, authorization code with
-PKCE). There is no password endpoint - `POST /auth/login` is permanently
-retired and answers 410.
+PKCE). The old password endpoint (`POST /auth/login`, "resource owner password
+credentials") has been removed on current installations - calling it returns an
+error whose message is *"Password login is disabled. Use the OIDC redirect
+flow."* There are two ways to sign in headlessly; the toolkit picks whichever
+fits your installation.
 
-The toolkit completes the redirect handshake over plain HTTP, so no browser and
-no extra packages are needed:
+### Option A - email + password (installations that still allow it)
+
+Some installations keep a password form on their identity provider. The toolkit
+drives the redirect handshake over plain HTTP, so no browser is needed:
 
 ```bash
 export BUD_API_URL=https://app.example.bud.studio
@@ -33,13 +38,51 @@ export BUD_PASSWORD='...'
 bud login
 ```
 
-What that does: starts the flow at `/auth/redirect/authorize`, follows the
+This fails on **OIDC-only installations** - ones that disable password login, or
+require MFA, a consent screen, or a corporate identity provider. There is no
+password form to submit, so `bud login` reports it could not find the sign-in
+form or that no session was issued. Use Option B instead.
+
+### Option B - reuse a bearer token (OIDC-only installations)
+
+The management API accepts a bearer token (`Authorization: Bearer <jwt>`) on
+every endpoint, so the toolkit can authenticate by **reusing a token that a real
+browser login already minted** - no password, no scraping. When any token source
+below is present, the toolkit uses it automatically (for every command, not just
+`bud login`) and refreshes it as it expires.
+
+Token sources, auto-detected; the freshest (latest-expiring) one wins, so a
+background refresh by the desktop app is picked up automatically:
+
+| Source | How to provide it |
+|---|---|
+| **Desktop app** | Sign in through the Bud Studio desktop app. It stores the token in `auth.json`, which the toolkit finds automatically (override with `BUD_DESKTOP_AUTH_FILE`). |
+| **Environment** | `export BUD_ACCESS_TOKEN=<jwt>` (and `BUD_REFRESH_TOKEN=<jwt>` so it can refresh itself). |
+| **Token file** | `export BUD_TOKEN_FILE=/path/to/token.json` - a JSON file with `accessToken`/`refreshToken`/`expiresAt` (or a bare token string). |
+
+```bash
+export BUD_API_URL=https://app.example.bud.studio
+# then just sign in through the desktop app, or export BUD_ACCESS_TOKEN
+bud login     # validates the token and prints who you are
+```
+
+The toolkit refreshes the access token via `POST /auth/refresh-token` and caches
+the rotated pair under `~/.bud/token-<profile>.json` (mode 0600). When the
+**refresh token** itself expires you get a `401 "Token Expired or Invalid"` - the
+only fix is to sign in again through the desktop app (which re-mints the token),
+then re-run the command. **Ask the user to do this; do not try to work around
+it.**
+
+> A bearer token obtained this way does not need a CSRF header - that is a
+> cookie-session construct - so mutating calls work the same way.
+
+What Option A does: starts the flow at `/auth/redirect/authorize`, follows the
 redirect to the identity provider, submits the credentials to the form target
 embedded in its sign-in page, and follows the callback back to Bud, which mints
 the session. The cookie jar is saved to `~/.bud/session-<profile>.txt`
 (mode 0600).
 
-### Things that will bite you
+### Things that will bite you (Option A)
 
 - **A wrong password is not an HTTP error.** The identity provider re-renders
   its sign-in page with HTTP 200 and the reason inside it. The toolkit parses
@@ -53,9 +96,11 @@ the session. The cookie jar is saved to `~/.bud/session-<profile>.txt`
   it from `BUD_API_URL` (`app.` -> `admin.`); set `BUD_UI_URL` when your
   installation names hosts differently.
 - **Corporate identity providers may demand a real browser** (device
-  compliance, hardware MFA, WebAuthn). If sign-in lands on an unexpected
-  screen, the toolkit says so - ask the user to sign in through the console
-  rather than trying to defeat it.
+  compliance, hardware MFA, WebAuthn), and OIDC-only installations disable the
+  password form entirely. If sign-in lands on an unexpected screen or reports it
+  found no form, switch to **Option B** - have the user sign in through the Bud
+  Studio desktop app, then let the toolkit reuse that token. Do not retry
+  password variations.
 
 ## CSRF
 
@@ -66,10 +111,17 @@ with a CSRF message - use `bud api` instead.
 
 ## Session expiry
 
-Sessions are renewed transparently: on a 401 the toolkit signs in once and
-replays the request. For that to work non-interactively, `BUD_EMAIL` and
-`BUD_PASSWORD` must remain in the environment. Without them you get a clear
-"run bud login" error instead of a hang.
+Expiry is handled transparently: on a 401 the toolkit renews once and replays
+the request.
+
+- **Option A (password):** `BUD_EMAIL` and `BUD_PASSWORD` must remain in the
+  environment so the re-sign-in is non-interactive. Without them you get a clear
+  "run bud login" error instead of a hang.
+- **Option B (bearer):** the access token is refreshed via `POST
+  /auth/refresh-token` using the refresh token, and the rotated pair is cached
+  under `~/.bud/token-<profile>.json`. When the refresh token *itself* expires
+  the renewal fails with `401 "Token Expired or Invalid"` - have the user sign
+  in again through the desktop app, then retry.
 
 ## Calling deployed models (inference auth)
 

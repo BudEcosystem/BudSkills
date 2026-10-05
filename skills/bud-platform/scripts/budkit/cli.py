@@ -124,8 +124,24 @@ def cmd_login(args: argparse.Namespace) -> int:
         profile=args.profile,
     )
     cfg.require("api_url")
+
+    # Bearer path: OIDC-only installs have no password login. If a token source
+    # is present (env, token file, or the desktop app's auth.json), validate it
+    # instead of asking for a password.
+    client = BudClient(cfg)
+    if client.tokens.available():
+        me = client.get("/users/me")
+        save_config({"api_url": cfg.api_url, "ui_url": cfg.ui_url})
+        _err(f"Signed in to {cfg.api_url} with a bearer token (source: {client.tokens.source()}).")
+        _out(unwrap(me, "user"))
+        return 0
+
     if not cfg.email:
-        raise SystemExit("bud: no email. Pass --email or set BUD_EMAIL.")
+        raise SystemExit(
+            "bud: no credentials. Set BUD_ACCESS_TOKEN (or sign in via the Bud Studio "
+            "desktop app so it writes auth.json) for OIDC-only installs, or pass --email / "
+            "set BUD_EMAIL for password sign-in."
+        )
     if not cfg.password:
         pw = os.environ.get("BUD_PASSWORD")
         if not pw:
@@ -133,7 +149,6 @@ def cmd_login(args: argparse.Namespace) -> int:
 
             pw = getpass.getpass(f"Password for {cfg.email}: ")
         cfg._values["password"] = pw
-    client = BudClient(cfg)
     client.login(force=args.force)
     me = client.get("/users/me")
     save_config({"api_url": cfg.api_url, "ui_url": cfg.ui_url, "email": cfg.email})
@@ -151,7 +166,8 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 def cmd_logout(args: argparse.Namespace) -> int:
     client = _client(args)
     client.session.clear()
-    _err("Signed out (local session discarded).")
+    client.tokens.clear()
+    _err("Signed out (local session and cached token discarded).")
     return 0
 
 
@@ -372,8 +388,15 @@ def cmd_token(args: argparse.Namespace) -> int:
     the last registration is rejected too.
     """
     client = _client(args)
-    payload = client.get("/auth/redirect/ws-token")
-    token = payload.get("ws_token") if isinstance(payload, dict) else None
+    expires = None
+    if client.tokens.available():
+        # Bearer mode: the access token is already a provider JWT; ws-token needs
+        # the cookie session we don't have, so register the bearer token directly.
+        token = client.tokens.current()
+    else:
+        payload = client.get("/auth/redirect/ws-token")
+        token = payload.get("ws_token") if isinstance(payload, dict) else None
+        expires = payload.get("expires_at") if isinstance(payload, dict) else None
     if not token:
         _err("Could not obtain a token for this session. Try: bud login --force")
         return 1
@@ -383,7 +406,6 @@ def cmd_token(args: argparse.Namespace) -> int:
         print(f"export BUD_GATEWAY_TOKEN={token}")
     else:
         print(token)
-    expires = payload.get("expires_at")
     if expires:
         _err(f"Token registered with the inference gateway; expires at epoch {expires}.")
     return 0
