@@ -93,9 +93,15 @@ bud login          # uses BUD_EMAIL + BUD_PASSWORD from the environment
 # then re-run the command that failed; the toolkit reuses the fresh session
 ```
 
-`bud login` drives the sign-in page headlessly - it reads the form target out of
-the page's embedded context, so it works even on single-page sign-in themes that
-render the form client-side, with no browser. It does need credentials:
+`bud login` is **safe to call anytime**: it first checks for an existing valid
+session - a usable bearer token (including the desktop app's `auth.json`, fresh or
+refreshable) or a cached cookie session - and reports "Already signed in" without
+re-authenticating. It only attempts a new sign-in when there is no valid session
+(use `--force` to re-authenticate regardless).
+
+When it does sign in, `bud login` drives the sign-in page headlessly - it reads the
+form target out of the page's embedded context, so it works even on single-page
+sign-in themes that render the form client-side, with no browser. It does need credentials:
 `BUD_EMAIL` and `BUD_PASSWORD` must be in the environment for a non-interactive
 retry. If they are not set, **ask the user to set them** (or to sign in) rather
 than guessing - repeated wrong passwords can lock the account.

@@ -122,6 +122,13 @@ def _tokens_from_mapping(data: dict[str, Any], source: str) -> _Candidate | None
     access = data.get("accessToken") or data.get("access_token") or data.get("token")
     if isinstance(access, dict):  # some envelopes nest the token set under "token"
         return _tokens_from_mapping(access, source)
+    if access is None:
+        # The desktop app's auth.json wraps the token set under a "session" key
+        # (tauri-plugin-store); other envelopes use "data". Unwrap and recurse.
+        for wrapper in ("session", "data"):
+            inner = data.get(wrapper)
+            if isinstance(inner, dict):
+                return _tokens_from_mapping(inner, source)
     if not isinstance(access, str) or not access:
         return None
     refresh = data.get("refreshToken") or data.get("refresh_token")

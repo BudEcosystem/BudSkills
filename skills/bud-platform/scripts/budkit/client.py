@@ -83,6 +83,21 @@ class BudClient:
             self.session.ensure(self.config.email, self.config.password)
             self._signed_in = True
 
+    def has_valid_session(self) -> bool:
+        """True if we are already signed in - a usable bearer token (fresh or
+        refreshable) or a live cached cookie session - WITHOUT attempting a new
+        password login. Lets `bud login` reuse an existing session instead of
+        re-authenticating every time."""
+        if self.tokens.available():
+            # Bearer mode: a GET validates (and refreshes on 401) with no password.
+            try:
+                self.request("GET", "/users/me")
+                return True
+            except BudError:
+                return False
+        # Cookie-only: probe the cached jar directly; never triggers a login.
+        return self.session.has_session and self.session.probe()
+
     # -- core request ---------------------------------------------------
 
     def request(

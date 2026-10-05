@@ -140,12 +140,19 @@ def cmd_login(args: argparse.Namespace) -> int:
         profile=args.profile,
     )
     cfg.require("api_url")
+    client = BudClient(cfg)
+
+    # Already signed in? Reuse an existing session (a usable bearer token or a
+    # cached cookie session) instead of logging in again. `--force` skips this.
+    if not args.force and client.has_valid_session():
+        _err(f"Already signed in to {cfg.api_url}.")
+        _out(unwrap(client.get("/users/me"), "user"))
+        return 0
 
     # Bearer path: if a token source is present (env, token file, or the desktop
     # app's auth.json), validate it instead of asking for a password.
-    client = BudClient(cfg)
     if client.tokens.available():
-        me = client.get("/users/me")
+        me = client.get("/users/me")  # raises auth-required (exit 77) if dead
         save_config({"api_url": cfg.api_url, "ui_url": cfg.ui_url})
         _err(f"Signed in to {cfg.api_url} with a bearer token (source: {client.tokens.source()}).")
         _out(unwrap(me, "user"))
