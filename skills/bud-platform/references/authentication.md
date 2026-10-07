@@ -19,6 +19,12 @@ unsuitable for automation - see "Project API keys" below. Prefer `bud token`.
 
 ## Signing in
 
+**In practice you just run `bud login`** - it is idempotent, reuses an existing
+session (the Bud Studio desktop app's `auth.json`, a cached `~/.bud/` session, or
+`BUD_ACCESS_TOKEN`), and verifies TLS itself. The mechanics below only matter
+when there is no session to reuse; you do not need to pre-inspect files, env
+vars, or certificates to connect.
+
 Bud uses browser-style single sign-on (OpenID Connect, authorization code with
 PKCE). The old password endpoint (`POST /auth/login`, "resource owner password
 credentials") has been removed on current installations - calling it returns an

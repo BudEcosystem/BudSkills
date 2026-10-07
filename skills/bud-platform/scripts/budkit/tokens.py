@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import BudAuthError
+from .net import ssl_context
 
 
 # Refresh a little before the token actually expires so an in-flight request
@@ -286,7 +287,7 @@ class TokenProvider:
             req.add_header("Referer", self.ui_url + "/")
             req.add_header("Origin", self.ui_url)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
             # 401 "Token Expired or Invalid" lands here when the refresh token is dead.

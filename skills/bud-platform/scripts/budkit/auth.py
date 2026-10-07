@@ -35,6 +35,7 @@ import urllib.request
 from pathlib import Path
 
 from .errors import BudAuthError
+from .net import ssl_context
 
 
 # The session cookie Bud sets once sign-in completes, and the CSRF companion
@@ -72,6 +73,7 @@ class Session:
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar),
             urllib.request.HTTPRedirectHandler(),
+            urllib.request.HTTPSHandler(context=ssl_context()),
         )
 
     # -- cookie helpers -------------------------------------------------
