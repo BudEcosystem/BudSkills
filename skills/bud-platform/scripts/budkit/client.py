@@ -25,6 +25,7 @@ from typing import Any, Iterator
 from .auth import Session
 from .config import Config
 from .errors import BudAPIError, BudAuthError
+from .tokens import TokenProvider
 
 
 # Retry on statuses that represent "try again", never on 4xx that represent
@@ -68,6 +69,7 @@ class BudClient:
         self.config.require("api_url")
         self.quiet = quiet
         self.session = Session(self.config.api_url, self.config.ui_url, jar_path=self.config.session_path)
+        self.tokens = TokenProvider(self.config)
         self._signed_in = False
 
     # -- session --------------------------------------------------------
@@ -80,6 +82,21 @@ class BudClient:
         if not self._signed_in:
             self.session.ensure(self.config.email, self.config.password)
             self._signed_in = True
+
+    def has_valid_session(self) -> bool:
+        """True if we are already signed in - a usable bearer token (fresh or
+        refreshable) or a live cached cookie session - WITHOUT attempting a new
+        password login. Lets `bud login` reuse an existing session instead of
+        re-authenticating every time."""
+        if self.tokens.available():
+            # Bearer mode: a GET validates (and refreshes on 401) with no password.
+            try:
+                self.request("GET", "/users/me")
+                return True
+            except BudError:
+                return False
+        # Cookie-only: probe the cached jar directly; never triggers a login.
+        return self.session.has_session and self.session.probe()
 
     # -- core request ---------------------------------------------------
 
@@ -108,7 +125,14 @@ class BudClient:
                 retries = int(os.environ.get("BUD_MAX_RETRIES", "4"))
             except ValueError:
                 retries = 4
-        if auth:
+        # Prefer bearer-token auth when a token source is configured (e.g. the
+        # desktop app's auth.json). But if that token is expired and we also hold
+        # a live cookie session from `bud login`, prefer the cookie -- a stale
+        # desktop token must not shadow a fresh interactive sign-in.
+        use_bearer = auth and self.tokens.available()
+        if use_bearer and self.tokens.is_expired() and self.session.has_session:
+            use_bearer = False
+        if auth and not use_bearer:
             self._ensure_session()
 
         url = self._build_url(path, params)
@@ -128,7 +152,11 @@ class BudClient:
             elif json_body is not None:
                 req.data = json.dumps(json_body).encode()
                 req.add_header("Content-Type", "application/json")
-            if method in _MUTATING and auth:
+            if use_bearer:
+                # Bearer auth is validated directly against the identity provider;
+                # it needs no CSRF token (that is a cookie-session construct).
+                req.add_header("Authorization", f"Bearer {self.tokens.current()}")
+            elif method in _MUTATING and auth:
                 token = self.session.csrf_token
                 if token:
                     req.add_header("x-csrf-token", token)
@@ -142,10 +170,17 @@ class BudClient:
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")
 
-                # An expired session is worth exactly one silent renewal.
+                # An expired session/token is worth exactly one silent renewal.
                 if exc.code == 401 and auth and not renewed:
                     renewed = True
                     attempt -= 1
+                    if use_bearer:
+                        try:
+                            if not self.tokens.handle_401():
+                                raise BudAPIError(exc.code, method, path, body) from exc
+                        except BudAuthError as aexc:
+                            raise BudAPIError(exc.code, method, path, str(aexc)) from exc
+                        continue
                     try:
                         self.session.ensure(self.config.email, self.config.password, force=True)
                     except BudAuthError:

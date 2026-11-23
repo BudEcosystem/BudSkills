@@ -32,34 +32,64 @@ answer. Never ask it twice in one task.
 
 ## 2. Connect
 
-The toolkit is `scripts/bud` in this skill. It needs only `python3` - no pip
-install, no browser.
+The toolkit is `scripts/bud` in this skill (needs only `python3` - no pip
+install, no browser). To sign in, **just run `bud login`**:
 
 ```bash
 export BUD_API_URL=https://app.example.bud.studio   # the Bud API origin
-export BUD_EMAIL=you@example.com
-export BUD_PASSWORD=...                              # or omit to be prompted
-bud login
+bud login        # signs in, or no-ops if already signed in
+bud whoami        # confirm who you are
 ```
 
-`bud login` caches the session under `~/.bud/` (mode 0600) and later commands
-reuse it, renewing automatically when it expires. Confirm with `bud whoami`.
+**`bud login` is idempotent and self-configuring - run it first, don't
+investigate.** It checks for an existing valid session and reports "Already
+signed in" without re-authenticating. It finds a session automatically, in
+order: the **Bud Studio desktop app's `auth.json`**, a cached `~/.bud/` session,
+`BUD_ACCESS_TOKEN`, or `BUD_EMAIL`/`BUD_PASSWORD`. It only needs you to supply
+something when there is no session at all.
+
+> **Do not** go hunting before logging in. Specifically do **not**: search the
+> filesystem for `auth.json`/token/config files, read `~/.codex/*`, set
+> `SSL_CERT_FILE` or configure TLS (the toolkit verifies certs itself), or grep
+> the environment for tokens. Run `bud login`; if `bud whoami` then works you
+> are connected - move on. This is the whole connect step; it should take one
+> or two commands, not a filesystem survey.
+
+The session is cached under `~/.bud/` (mode 0600) and later commands reuse it,
+renewing automatically. Only when there is genuinely **no** session (a fresh
+machine or CI) do you need to supply a credential - `export BUD_EMAIL` and
+`BUD_PASSWORD` (or `BUD_ACCESS_TOKEN`), then `bud login`.
 
 If `bud` is not on your PATH, run `bash scripts/setup.sh` once, or call it by
 its path: `<skill-dir>/scripts/bud`.
 
-**Bud sign-in is browser-style single sign-on** - there is no password API
-endpoint. The toolkit completes the redirect handshake over plain HTTP for you.
+**Bud sign-in is browser-style single sign-on** (OpenID Connect). There are two
+ways in and the toolkit picks whichever fits the installation:
+
+- **Password** (above): works where the identity provider still shows a password
+  form; the toolkit drives the redirect handshake over plain HTTP for you.
+- **Bearer token** (OIDC-only installations): many installations **disable
+  password login** - `bud login` then reports it found no sign-in form. In that
+  case reuse a token minted by a real browser login: have the user sign in
+  through the **Bud Studio desktop app** (it writes `auth.json`, which the
+  toolkit finds automatically), or `export BUD_ACCESS_TOKEN=<jwt>`. The toolkit
+  then authenticates with the token and refreshes it on its own.
+
 Consequences worth knowing:
 
-- Mutating calls need a CSRF header. The toolkit adds it; hand-rolled `curl`
-  will get 403.
+- Mutating calls need a CSRF header in password mode. The toolkit adds it;
+  hand-rolled `curl` will get 403. (Bearer mode needs no CSRF.)
 - Wrong passwords are reported by the identity provider, and **repeated
   failures can lock the account**. If sign-in fails, stop and confirm the
   credential - do not retry variations.
-- Some installations use a corporate identity provider that requires a real
-  browser. If `bud login` reports it landed on an unexpected screen, ask the
-  user to sign in via the console and say so; do not try to work around it.
+- If `bud login` reports it landed on an unexpected screen or found no form, the
+  install is OIDC-only or needs MFA/consent: switch to the bearer token above.
+  Do not try to defeat the browser flow.
+- **If any `bud` command exits `77` or prints `__BUD_AUTH_REQUIRED__`**, the
+  session is dead. Re-run **`bud login`** (it uses `BUD_EMAIL`/`BUD_PASSWORD` from
+  the environment and works headlessly against single-page sign-in themes), then
+  re-run the command. If credentials aren't set, ask the user to set them. See
+  `references/authentication.md`.
 
 See `references/authentication.md` for API keys, multi-tenant profiles,
 service accounts and non-interactive/CI setups.
