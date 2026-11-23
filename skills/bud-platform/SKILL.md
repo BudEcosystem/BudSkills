@@ -32,18 +32,33 @@ answer. Never ask it twice in one task.
 
 ## 2. Connect
 
-The toolkit is `scripts/bud` in this skill. It needs only `python3` - no pip
-install, no browser.
+The toolkit is `scripts/bud` in this skill (needs only `python3` - no pip
+install, no browser). To sign in, **just run `bud login`**:
 
 ```bash
 export BUD_API_URL=https://app.example.bud.studio   # the Bud API origin
-export BUD_EMAIL=you@example.com
-export BUD_PASSWORD=...                              # or omit to be prompted
-bud login
+bud login        # signs in, or no-ops if already signed in
+bud whoami        # confirm who you are
 ```
 
-`bud login` caches the session under `~/.bud/` (mode 0600) and later commands
-reuse it, renewing automatically when it expires. Confirm with `bud whoami`.
+**`bud login` is idempotent and self-configuring - run it first, don't
+investigate.** It checks for an existing valid session and reports "Already
+signed in" without re-authenticating. It finds a session automatically, in
+order: the **Bud Studio desktop app's `auth.json`**, a cached `~/.bud/` session,
+`BUD_ACCESS_TOKEN`, or `BUD_EMAIL`/`BUD_PASSWORD`. It only needs you to supply
+something when there is no session at all.
+
+> **Do not** go hunting before logging in. Specifically do **not**: search the
+> filesystem for `auth.json`/token/config files, read `~/.codex/*`, set
+> `SSL_CERT_FILE` or configure TLS (the toolkit verifies certs itself), or grep
+> the environment for tokens. Run `bud login`; if `bud whoami` then works you
+> are connected - move on. This is the whole connect step; it should take one
+> or two commands, not a filesystem survey.
+
+The session is cached under `~/.bud/` (mode 0600) and later commands reuse it,
+renewing automatically. Only when there is genuinely **no** session (a fresh
+machine or CI) do you need to supply a credential - `export BUD_EMAIL` and
+`BUD_PASSWORD` (or `BUD_ACCESS_TOKEN`), then `bud login`.
 
 If `bud` is not on your PATH, run `bash scripts/setup.sh` once, or call it by
 its path: `<skill-dir>/scripts/bud`.
